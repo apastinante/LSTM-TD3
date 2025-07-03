@@ -1,7 +1,7 @@
 from copy import deepcopy
 import numpy as np
-import pybullet_envs    # To register tasks in PyBullet
-import gym
+# import pybullet_envs    # To register tasks in PyBullet
+import gymnasium as gym
 import time
 import torch
 import torch.nn as nn
@@ -9,11 +9,696 @@ from torch.optim import Adam
 from lstm_td3.utils.logx import EpochLogger, setup_logger_kwargs, colorize
 import itertools
 from lstm_td3.env_wrapper.pomdp_wrapper import POMDPWrapper
-from lstm_td3.env_wrapper.env import make_bullet_task
+# from lstm_td3.env_wrapper.env import make_bullet_task
 import os
 import os.path as osp
 import json
 from collections import namedtuple
+from tqdm import tqdm
+
+# Add beam environment imports
+import contextlib
+import pickle
+import matplotlib.pyplot as plt
+import blond.utils.bmath as bm
+from blond.beam.beam import Beam, Proton
+from blond.beam.distributions import matched_from_distribution_function
+from blond.beam.profile import CutOptions, Profile
+from blond.input_parameters.rf_parameters import RFStation
+from blond.input_parameters.ring import Ring
+from blond.trackers.tracker import RingAndRFTracker, FullRingAndRF
+from blond.impedances.impedance import (InducedVoltageFreq, InductiveImpedance,
+                                        TotalInducedVoltage)
+from blond.impedances.impedance_sources import InputTable
+from scipy.constants import c
+from gymnasium import spaces
+
+
+# FIXES IMPLEMENTED:
+# 1. Fixed the issue with the gymnasium environment (used an older version of gymnasium)
+# 2. Fixed the issue with the logger kwargs
+# 3. Fixed the issue with the data directory
+# 4. Fixed the issue with the experiment name
+
+
+# ===== BEAM ENVIRONMENT FUNCTIONS AND CLASSES =====
+
+def load_magnetic_field(b_choice: int):
+    """Load and process magnetic field program"""
+    if b_choice == 1:
+        sync_momentum = np.load('/afs/cern.ch/work/a/apastina/DatasetGen/datasetgenerator/programs/unnamed/Bfield.npy')
+        t_arr = sync_momentum[0].flatten()  # Time array [s]
+        B_field = sync_momentum[1].flatten() * 1e-4  # Convert to Tesla
+
+    elif b_choice == 2:
+        sync_momentum = np.load('/afs/cern.ch/work/a/apastina/DatasetGen/datasetgenerator/programs/TOF/Bfield.npy')
+        t_arr = sync_momentum[0].flatten()  # Time array [s]
+        B_field = sync_momentum[1].flatten() * 1e-4  # Convert to Tesla
+
+    # Trim to injection/extraction window
+    inj_idx = np.where(t_arr <= 275)[0][-1]
+    ext_idx = np.where(t_arr >= 805)[0][0]
+
+    return {
+        't_arr': (t_arr[inj_idx:ext_idx] - t_arr[inj_idx]) / 1e3,
+        'B_field': B_field[inj_idx:ext_idx],
+        'sync_momentum': B_field[inj_idx:ext_idx] * 8.239 * c
+    }
+
+def initialize_accelerator_parameters():
+    """Return fixed machine parameters"""
+    return {
+        'radius': 25.0,          # Machine radius [m]
+        'bend_radius': 8.239,    #Bending radius [m]
+        'gamma_transition': 4.4, # Transition gamma
+        'n_particles': 0.9e13,   # Number of particles
+        'n_macroparticles': 1e6, # Macro-particle count
+        'harmonic_numbers': [1, 2], # RF harmonics
+        'n_rf_systems': 2        # Number of RF systems
+    }
+
+def calculate_bdot_parameters(B_data):
+    """Calculate B-dot and key indices"""
+    B_dot = np.gradient(B_data['B_field'], B_data['t_arr'])
+    ind_max = np.argmax(B_dot)
+    return [0, ind_max // 2, (2 * ind_max) // 3, ind_max]
+
+def simulate_beam_profile_PSB(params, phi, random_phase_shift, noise=None, imp=True):
+    """Parallelizable beam profile simulation function"""
+    # Suppress any stdout/stderr during the simulation
+    with open(os.devnull, 'w') as devnull, \
+         contextlib.redirect_stdout(devnull), \
+         contextlib.redirect_stderr(devnull):
+
+        B_choice, total_voltage, v_ratio, B_ind, filling_factor = params
+        bm.use_precision('single')
+
+        # Calculate actual B-dot value from index
+        B_data = load_magnetic_field(B_choice)
+        v1 = total_voltage / (1 + v_ratio)
+        v2 = v1 * v_ratio
+        B_dot = np.gradient(B_data['B_field'], B_data['t_arr'])[B_ind]
+
+        # --- MAIN SIMULATION CODE ---
+        machine_params = initialize_accelerator_parameters()
+        ring = Ring(
+            2 * np.pi * machine_params['radius'],
+            1 / machine_params['gamma_transition'] ** 2,
+            (B_data['t_arr'][B_ind:B_ind+2], B_data['sync_momentum'][B_ind:B_ind+2]),
+            Proton(),
+            bending_radius=machine_params['bend_radius']
+        )
+        rf_station = RFStation(
+            ring,
+            machine_params['harmonic_numbers'],
+            [v1, v2],
+            [np.pi, np.pi + phi + random_phase_shift],
+            machine_params['n_rf_systems']
+        )
+        beam = Beam(ring, machine_params['n_macroparticles'], machine_params['n_particles'])
+        n_slices = 1000
+        profile = Profile(
+            beam,
+            CutOptions(cut_left=0, cut_right=ring.t_rev[0], n_slices=n_slices)
+        )
+
+        # Compute synchronous phase and emittance
+        phi_s_app = ring.delta_E[0][0] / v1
+        if np.abs(phi_s_app) > 1:
+            phi_s_app = np.sign(phi_s_app) * 1.1
+        else:
+            phi_s = np.arcsin(phi_s_app)
+        emittance = (
+            8 / (2 * np.pi * 1 / ring.t_rev[0])
+            * (1 - phi_s_app) / (1 + phi_s_app)
+            * np.sqrt(
+                (2 * total_voltage * ring.beta[0][0]**2 * ring.energy[0][0])
+                / (2 * np.pi * np.abs(1 / machine_params['gamma_transition']**2
+                      - 1 / ring.gamma[0][0]**2))
+            )
+        )
+
+        # Finemet cavity impedance table
+        F_C = np.loadtxt(
+            '/afs/cern.ch/work/a/apastina/DatasetGen/datasetgenerator/EX_02_Finemet.txt',
+            dtype=float, skiprows=1
+        )
+        F_C[:, 3] *= np.pi / 180
+        F_C[:, 5] *= np.pi / 180
+        F_C[:, 7] *= np.pi / 180
+
+        option = "closed loop"
+        if option == "open loop":
+            Re_Z = F_C[:, 4] * np.cos(F_C[:, 3])
+            Im_Z = F_C[:, 4] * np.sin(F_C[:, 3])
+        elif option == "closed loop":
+            Re_Z = F_C[:, 2] * np.cos(F_C[:, 5])
+            Im_Z = F_C[:, 2] * np.sin(F_C[:, 5])
+        else:
+            Re_Z = F_C[:, 6] * np.cos(F_C[:, 7])
+            Im_Z = F_C[:, 6] * np.sin(F_C[:, 7])
+        F_C_table = InputTable(F_C[:, 0], 13 * Re_Z, 13 * Im_Z)
+
+        # Impedance contributions
+        steps = InductiveImpedance(
+            beam, profile, 34.6669349520904 / 10e9 * ring.f_rev,
+            rf_station, deriv_mode='diff'
+        )
+        dir_space_charge = InductiveImpedance(
+            beam, profile,
+            -376.730313462 / (ring.beta[0] * ring.gamma[0]**2),
+            rf_station
+        )
+        imp_list = [F_C_table]
+        ind_volt_freq = InducedVoltageFreq(
+            beam, profile, imp_list, frequency_resolution=2e5
+        )
+        total_induced_voltage = TotalInducedVoltage(
+            beam, profile, [ind_volt_freq, steps, dir_space_charge]
+        )
+        total_induced_voltage.track()
+
+        tracker = RingAndRFTracker(
+            rf_station, beam,
+            Profile=profile, TotalInducedVoltage=total_induced_voltage
+        )
+        full_rrf = FullRingAndRF([tracker])
+
+        try:
+            full_rrf.track()
+            matched_from_distribution_function(
+                beam, full_rrf,
+                distribution_type='parabolic_line',
+                emittance=emittance * filling_factor,
+                process_pot_well=True,
+                TotalInducedVoltage=total_induced_voltage
+            )
+            profile.track()
+        except Exception as e:
+            return {
+                'status': 'failed',
+                'error': str(e),
+                'total_voltage': total_voltage,
+                'v_ratio': v_ratio,
+                'B_dot': B_dot,
+                'B_ind': B_ind,
+                'emittance': emittance * filling_factor,
+                'filling_factor': filling_factor,
+                'phi': phi,
+                'B': B_data['B_field'][B_ind],
+                'phi_s': phi_s,
+                'random_phase_shift': random_phase_shift
+            }
+
+        # Center profile and re-track
+        half_trev = ring.t_rev[0] / 2
+        center_of_weight = np.mean(beam.dt)
+        profile.cut_options.cut_left = center_of_weight - half_trev
+        profile.cut_options.cut_right = center_of_weight + half_trev
+        profile.set_slices_parameters()
+        profile.track()
+
+        norm_bin_centers = profile.bin_centers / ring.t_rev[0]
+
+        if noise is None:
+            return {
+                'status': 'created',
+                'total_voltage': total_voltage,
+                'v_ratio': v_ratio,
+                'B_dot': B_dot,
+                'B_ind': B_ind,
+                'emittance': emittance * filling_factor,
+                'filling_factor': filling_factor,
+                'phi': phi,
+                'B': B_data['B_field'][B_ind],
+                'profile': np.column_stack((
+                    norm_bin_centers,
+                    profile.n_macroparticles / np.max(profile.n_macroparticles)
+                )),
+                'phi_s': phi_s,
+                'random_phase_shift': random_phase_shift
+            }
+        else:
+            noise_arr = np.random.normal(
+                0,
+                noise * np.max(profile.n_macroparticles),
+                len(profile.n_macroparticles)
+            )
+            noisy_profile = profile.n_macroparticles + noise_arr
+            return {
+                'status': 'created',
+                'total_voltage': total_voltage,
+                'v_ratio': v_ratio,
+                'B_dot': B_dot,
+                'B_ind': B_ind,
+                'emittance': emittance * filling_factor,
+                'filling_factor': filling_factor,
+                'phi': phi,
+                'B': B_data['B_field'][B_ind],
+                'profile': np.column_stack((
+                    norm_bin_centers,
+                    noisy_profile / np.max(noisy_profile)
+                )),
+                'phi_s': phi_s,
+                'random_phase_shift': random_phase_shift
+            }
+    
+def cyclic_distance(x, y):
+    diff = (x - y) % (2*np.pi)
+    return np.abs(-np.pi + (diff + np.pi) % (2*np.pi))
+
+def cyclic_distance_w_sign(x, y):
+    diff = (x - y) % (2*np.pi)
+    return -np.pi + (diff + np.pi) % (2*np.pi)
+
+class BeamEnvironmentFixed:
+    """Fixed version with stabilized reward function"""
+    def __init__(self, simulate_func, optimal_phases, max_ep_len):
+        self.simulate_profile = simulate_func
+        self.optimal_phases = optimal_phases
+        self.param_ids = list(optimal_phases.keys())
+        self._order = np.arange(len(self.param_ids))
+        # Simplified curriculum
+        self.filling_factors = [0.2, 0.5, 0.75, 1.0, 1.25]
+        np.random.shuffle(self._order)
+        self._next_idx = 0
+        self._completed_ffs = {idx: set() for idx in range(len(self.param_ids))}
+        
+        self.max_steps = max_ep_len
+        
+        # FIXED REWARD COEFFICIENTS - Much more conservative
+        self.distance_coeff = 2.0        # Base distance penalty (was 5.0)
+        self.progress_coeff = 1.0        # Progress reward (was 20.0!)
+        self.action_penalty_coeff = 0.1  # Action penalty (was 0.5)
+        self.convergence_bonus = 20.0    # Convergence bonus (was 100)
+        self.smart_adjustment_bonus = 10.0 # Smart adjustment bonus (was 50)
+
+    def reset(self, seed=None):
+        if seed is not None:
+            np.random.seed(seed)
+            
+        # Parameter selection logic (simplified from original)
+        idx = self._order[self._next_idx]
+        available_ffs = [i for i in range(len(self.filling_factors)) 
+                        if i not in self._completed_ffs[idx]]
+        
+        if not available_ffs:
+            self._next_idx = (self._next_idx + 1) % len(self._order)
+            if self._next_idx == 0:
+                np.random.shuffle(self._order)
+                self._completed_ffs = {idx: set() for idx in range(len(self.param_ids))}
+            idx = self._order[self._next_idx]
+            available_ffs = list(range(len(self.filling_factors)))
+                
+        ff_idx = np.random.choice(available_ffs)
+        self._completed_ffs[idx].add(ff_idx)
+                
+        self.current_param = list(self.param_ids[idx])
+        self.current_ff = self.filling_factors[ff_idx]
+        self.sim_params = [1] + self.current_param + [self.current_ff]
+        
+        # Phase initialization
+        self.random_phase_shift = np.random.uniform(-np.pi, np.pi)
+        self.optimal_phase_rel = (
+            self.optimal_phases[tuple(self.current_param)] - np.pi - self.random_phase_shift
+        )
+        
+        # REMOVED ADAPTIVE NOISE: Always start with full random initialization
+        self.current_phase_rel = self._phase_wrap(
+            self.optimal_phase_rel + np.random.uniform(-np.pi, np.pi)
+        )
+        
+        self.current_rel_dist = cyclic_distance(self.optimal_phase_rel, self.current_phase_rel)
+        self.current_dist_w_sign = cyclic_distance_w_sign(self.optimal_phase_rel, self.current_phase_rel)
+        self.best_dist = self.current_rel_dist
+        # Generate profile
+        result = self.simulate_profile(self.sim_params, self.current_phase_rel, self.random_phase_shift)
+        try:
+            self.current_profile = result['profile'][:, 1].reshape(1, -1)
+            self.phi_s = result['phi_s'] / np.pi
+        except:
+            self.current_profile = np.zeros((1, 1000))
+            self.phi_s = 0.0
+
+        self.steps = 0
+        return [self.current_profile, self.phi_s]
+
+    def step(self, action):
+        """FIXED REWARD FUNCTION - Much more stable"""
+        prev_dist = self.current_rel_dist
+        
+        # Apply phase adjustment
+        new_phase_rel = self._phase_wrap(self.current_phase_rel + action)
+        
+        # Simulate new profile
+        results = self.simulate_profile(self.sim_params, float(new_phase_rel), self.random_phase_shift)
+        try:
+            new_profile = np.expand_dims(results['profile'][:, 1], axis=0)
+            simulation_penalty = 0
+        except:
+            new_profile = np.zeros((1, 1000))
+            simulation_penalty = 10
+
+        # Calculate new distance
+        self.current_rel_dist = cyclic_distance(self.optimal_phase_rel, new_phase_rel)
+        self.current_dist_w_sign = cyclic_distance_w_sign(self.optimal_phase_rel, new_phase_rel)
+        self.best_dist = min(self.best_dist, self.current_rel_dist)
+        
+        # STABILIZED REWARD COMPONENTS
+        
+        # 1. Smooth distance penalty
+        distance_reward = -self.distance_coeff * (self.current_rel_dist / np.pi)
+        
+        # 2. FIXED Progress reward - capped with tanh to prevent explosive rewards
+        progress = prev_dist - self.current_rel_dist 
+        progress_reward = self.progress_coeff * np.tanh(progress / (np.pi/4))
+        
+        # 3. Gentle action penalty
+        action_penalty = -self.action_penalty_coeff * (abs(action) / np.pi)
+        
+        # 4. Smart adjustment bonus - only for fine corrections
+        smart_bonus = 0
+        if (self.current_rel_dist <= 5 * np.pi / 180 and 
+            abs(action) <= self.current_rel_dist and 
+            np.sign(action) == np.sign(self.current_dist_w_sign)):
+            smart_bonus = self.smart_adjustment_bonus / ((1 + (self.current_rel_dist-abs(action)) * 180/np.pi)*(self.steps+1)) 
+        
+        # 5. Smooth convergence bonus
+        convergence_bonus = 0
+        if self.current_rel_dist < (np.pi * 0.5 / 180):  # Within 0.5 degrees
+            convergence_bonus = self.convergence_bonus * np.exp(-self.current_rel_dist * 10)
+        
+        # Combine rewards
+        reward = distance_reward + progress_reward + action_penalty + smart_bonus + convergence_bonus - simulation_penalty
+        
+        # Update state
+        self.current_phase_rel = new_phase_rel
+        self.current_profile = new_profile
+        self.steps += 1
+
+        # Termination
+        done_convergence = self.current_rel_dist < (np.pi * 0.5 / 180)
+        done_steps = self.steps >= self.max_steps
+        done = done_convergence or done_steps
+
+        return [new_profile, self.phi_s], reward, done
+
+    def _phase_wrap(self, phase):
+        return (phase + np.pi) % (2 * np.pi) - np.pi
+
+class GymBeamEnvFixedWithMetrics(gym.Env):
+    """Fixed Gym wrapper with metrics tracking"""
+    def __init__(self, optimal_phases, max_ep_len):
+        super().__init__()
+        self.env = BeamEnvironmentFixed(simulate_beam_profile_PSB, optimal_phases, max_ep_len)
+        
+        # Observation space
+        self.observation_space = spaces.Box(low=0, high=1, shape=(1001,), dtype=np.float32)
+        
+        # REDUCED Action space for stability
+        max_action = np.pi / 4  # Reduced from π
+        self.action_space = spaces.Box(low=-max_action, high=max_action, shape=(1,), dtype=np.float32)
+        
+        # Metrics tracking
+        self.episode_actions = []
+        self.episode_converged = False
+        
+    def reset(self, seed=None):
+        state = self.env.reset(seed)
+        profile = state[0].reshape(-1)
+        phi_s = [state[1]] if np.isscalar(state[1]) else state[1].reshape(-1)
+        
+        # Reset metrics
+        self.episode_actions = []
+        self.episode_converged = False
+        
+        return np.concatenate([profile, phi_s]).astype(np.float32), {}
+
+    def step(self, action):
+        # Track action magnitude
+        self.episode_actions.append(abs(float(action[0])))
+        
+        next_state, reward, done = self.env.step(float(action[0]))
+        
+        # Check convergence
+        if done:
+            self.episode_converged = self.env.current_rel_dist < (np.pi * 0.5 / 180)
+        
+        profile = next_state[0].reshape(-1)
+        phi_s = [next_state[1]] if np.isscalar(next_state[1]) else next_state[1].reshape(-1)
+        obs = np.concatenate([profile, phi_s]).astype(np.float32)
+        
+        return obs, float(reward), done, False, {
+            'avg_action': np.mean(self.episode_actions) if self.episode_actions else 0.0,
+            'converged': self.episode_converged
+        }
+class TestBeamEnvironment:
+    def __init__(self, simulate_func, optimal_phases, max_ep_len):
+        self.simulate_profile = simulate_func
+        self.optimal_phases = optimal_phases  # Dict {param_id: optimal_phase}
+        self.param_ids = list(optimal_phases.keys())
+        self.param_idxs = list(range(len(self.param_ids)))
+        self._order = np.arange(len(self.param_ids))
+        np.random.shuffle(self._order)
+        self._next_idx = 0
+        self.current_param = None
+        self.current_phase_rel = None
+        self.current_profile = None
+        self.phi_s = None
+        self.max_steps = max_ep_len
+        self.convergence_threshold = 1  # Start with 1 deg 
+        self.max_voltage = 24e3  # V
+        self.max_B = 1.2  # T
+        self.max_B_dot = 3.7  # T/s
+        # FIXED REWARD COEFFICIENTS - Much more conservative
+        self.distance_coeff = 2.0        # Base distance penalty (was 5.0)
+        self.progress_coeff = 1.0        # Progress reward (was 20.0!)
+        self.action_penalty_coeff = 0.1  # Action penalty (was 0.5)
+        self.convergence_bonus = 20.0    # Convergence bonus (was 100)
+        self.smart_adjustment_bonus = 10.0 # Smart adjustment bonus (was 50)
+
+    def reset(self,seed = None):
+        self.seed = seed
+        if seed is not None:
+            np.random.seed(seed)
+        # Select a random parameter combination
+        idx = self._order[self._next_idx]
+        self._next_idx += 1
+        if self._next_idx >= len(self._order):
+            np.random.shuffle(self._order)
+            self._next_idx = 0
+        self.current_param = list(self.param_ids[idx])
+        self.current_ff = np.random.uniform(0.1, 3)
+        self.sim_params = [1] + self.current_param + [self.current_ff]
+        # Get initial phase (could be from dataset or perturb optimal)
+        self.random_phase_shift = np.random.uniform(-np.pi, np.pi)
+        self.optimal_phase_rel = (
+            self.optimal_phases[tuple(self.current_param)]
+            - np.pi
+            - self.random_phase_shift
+        )
+        self.current_phase_rel = self._phase_wrap(
+            self.optimal_phase_rel + np.random.uniform(-np.pi, np.pi)
+        )
+        self.current_rel_dist = cyclic_distance(
+            self.optimal_phase_rel, self.current_phase_rel
+        )
+        self.current_dist_w_sign = cyclic_distance_w_sign(
+            self.optimal_phase_rel, self.current_phase_rel
+        )
+        # Generate initial profile
+        result = self.simulate_profile(
+            self.sim_params,
+            self.current_phase_rel,
+            self.random_phase_shift,
+        )
+        try:
+            self.current_profile = result['profile'][:, 1].unsqueeze(0)
+            self.phi_s = result['phi_s'] / np.pi
+        except:
+            self.current_profile = np.zeros((1, 1000))
+            self.phi_s = result['phi_s'] / np.pi
+
+        self.steps = 0
+        return [self.current_profile, self.phi_s]
+
+    def reset_eval(self, params, optimal_phase):
+        current_phase = np.random.uniform(-np.pi, np.pi)
+        self.current_phase_rel = self._phase_wrap(current_phase - np.pi + optimal_phase)
+        self.optimal_phase_rel = self._phase_wrap(optimal_phase - np.pi)
+        
+        self.current_dist_w_sign = cyclic_distance_w_sign(
+            self.optimal_phase_rel, self.current_phase_rel
+        )
+        self.current_rel_dist = np.abs(self.current_dist_w_sign)
+        # self.random_phase_shift = np.random.uniform(-np.pi, np.pi)
+        # Generate initial profile
+        self.current_ff = np.random.uniform(0.1, 1)
+        self.sim_params = [1] + list(params) + [self.current_ff]
+        self.random_phase_shift = 0.0
+        result = self.simulate_profile(
+            self.sim_params,
+            self.current_phase_rel,
+            self.random_phase_shift,
+        )
+        try:
+            self.current_profile = result['profile'][:, 1].unsqueeze(0)
+            self.phi_s = result['phi_s'] / np.pi
+        except:
+            self.current_profile = np.zeros((1, 1000))
+            self.phi_s = result['phi_s'] / np.pi
+
+        self.steps = 0
+        return [self.current_profile, self.phi_s]
+
+    def step(self, action):
+        """FIXED REWARD FUNCTION - Much more stable"""
+        prev_dist = self.current_rel_dist
+        
+        # Apply phase adjustment
+        new_phase_rel = self._phase_wrap(self.current_phase_rel + action)
+        
+        # Simulate new profile
+        results = self.simulate_profile(self.sim_params, float(new_phase_rel), self.random_phase_shift)
+        try:
+            new_profile = np.expand_dims(results['profile'][:, 1], axis=0)
+            simulation_penalty = 0
+        except:
+            new_profile = np.zeros((1, 1000))
+            simulation_penalty = 10
+
+        # Calculate new distance
+        self.current_rel_dist = cyclic_distance(self.optimal_phase_rel, new_phase_rel)
+        self.current_dist_w_sign = cyclic_distance_w_sign(self.optimal_phase_rel, new_phase_rel)
+        # self.best_dist = min(self.best_dist, self.current_rel_dist)
+        
+        # STABILIZED REWARD COMPONENTS
+        
+        # 1. Smooth distance penalty
+        distance_reward = -self.distance_coeff * (self.current_rel_dist / np.pi)
+        
+        # 2. FIXED Progress reward - capped with tanh to prevent explosive rewards
+        progress = prev_dist - self.current_rel_dist 
+        progress_reward = self.progress_coeff * np.tanh(progress / (np.pi/4))
+        
+        # 3. Gentle action penalty
+        action_penalty = -self.action_penalty_coeff * (abs(action) / np.pi)
+        
+        # 4. Smart adjustment bonus - only for fine corrections
+        smart_bonus = 0
+        if (self.current_rel_dist <= 5 * np.pi / 180 and 
+            abs(action) <= self.current_rel_dist and 
+            np.sign(action) == np.sign(self.current_dist_w_sign)):
+            smart_bonus = self.smart_adjustment_bonus / ((1 + (self.current_rel_dist-abs(action)) * 180/np.pi)*(self.steps+1)) 
+        
+        # 5. Smooth convergence bonus
+        convergence_bonus = 0
+        if self.current_rel_dist < (np.pi * 0.5 / 180):  # Within 0.5 degrees
+            convergence_bonus = self.convergence_bonus * np.exp(-self.current_rel_dist * 10)
+        
+        # Combine rewards
+        reward = distance_reward + progress_reward + action_penalty + smart_bonus + convergence_bonus - simulation_penalty
+        
+        # Update state
+        self.current_phase_rel = new_phase_rel
+        self.current_profile = new_profile
+        self.steps += 1
+
+        # Termination
+        done_convergence = self.current_rel_dist < (np.pi * 0.5 / 180)
+        done_steps = self.steps >= self.max_steps
+        done = done_convergence or done_steps
+
+        return [new_profile, self.phi_s], reward, done
+
+    def _phase_wrap(self, phase):
+        return (phase + np.pi) % (2 * np.pi) - np.pi
+    
+
+def _make_test_gym_env(optimal_phases_path, max_ep_len):
+    class GymBeamEnv(gym.Env):  # noqa
+        """
+        Gym wrapper for the BeamEnvironment.
+        Observation: concatenated beam profile (1000,) and phi_s (1,) -> shape (1001,)
+        Action: phase adjustment in radians, shape (1,)
+        """
+        metadata = {'render_modes': ['human', 'rgb_array']}
+
+        def __init__(self, optimal_phases_path, max_ep_len):
+            super(GymBeamEnv, self).__init__()
+            optimal_phases = pickle.load(open(optimal_phases_path, 'rb'))
+            self.env = TestBeamEnvironment(simulate_beam_profile_PSB, optimal_phases, max_ep_len)
+            # Observation: profile (1000,) [0,1] + phi_s (1,) [-1,1] => (1001,)
+            obs_dim = 1001
+            self.observation_space = spaces.Box(
+                low=-1, high=1, shape=(obs_dim,), dtype=np.float32
+            )
+            # Action: one-dimensional phase adjustment in [-pi/2, pi/2]
+            max_action = np.pi 
+            self.action_space = spaces.Box(
+                low=-max_action, high=max_action, shape=(1,), dtype=np.float32
+            )
+            # Support video recording: set render_mode for VecEnv
+            self.render_mode = 'rgb_array'
+        
+        def reset(self, seed = None):
+            self.state = self.env.reset(seed)
+
+            profile= self.state[0].reshape(-1)
+            phi_s = self.state[1].reshape(-1)
+
+            return np.concatenate([profile, phi_s]).astype(np.float32), {}
+
+        def step(self, action):
+            # action: array of shape (1,)
+            action_env = float(action[0])
+            next_state, reward, done = self.env.step(np.array(action_env))
+            self.state = next_state
+            profile = next_state[0].reshape(-1)
+            phi_s = next_state[1].reshape(-1)
+            
+            obs = np.concatenate([profile, phi_s]).astype(np.float32)
+            # Convert reward to Python float
+            try:
+                reward = float(reward.get())
+            except:
+                reward = float(reward)
+            return obs, reward, done, False, {}
+        def render(self, mode='rgb_array'):
+            import numpy as _np
+            # Create a figure without blocking
+            fig = plt.figure()
+            plt.title(f"Synchronous Phase: {self.state[1]:.3f}")
+            # Plot the current profile
+            plt.plot(self.state[0][0])
+            plt.ylim(0, 1.1)
+            plt.xlim(0, 1000)
+            plt.xlabel('Slice index')
+            plt.ylabel('Normalized number of particles')
+            # Draw the canvas and convert to RGB numpy array
+            fig.canvas.draw()
+            width, height = fig.canvas.get_width_height()
+            img = _np.frombuffer(fig.canvas.tostring_argb(), dtype='uint8').reshape(height, width, 4)
+            # Convert to RGB by dropping the alpha channel
+            img = img[..., 1:]
+            plt.close(fig)
+            if mode == 'human':
+                # Display image for human viewer
+                import cv2
+                cv2.imshow('GymBeamEnv', img[..., ::-1])
+                cv2.waitKey(1)
+                return None
+            # Return RGB array for video recording
+            return img
+
+    return GymBeamEnv(optimal_phases_path, max_ep_len)
+
+def make_beam_env(optimal_phases_path, max_ep_len):
+    """Create beam environment for LSTM-TD3"""
+    optimal_phases = pickle.load(open(optimal_phases_path, 'rb'))
+    return GymBeamEnvFixedWithMetrics(optimal_phases, max_ep_len)
+
+# ===== END BEAM ENVIRONMENT =====
 
 
 class ReplayBuffer:
@@ -375,6 +1060,12 @@ def lstm_td3(resume_exp_dir=None,
              actor_cur_feature_hid_sizes=(128,),
              actor_post_comb_hid_sizes=(128,),
              actor_hist_with_past_act=False,
+             # Beam environment parameters
+             use_beam_env=False,
+             optimal_phases_path='',
+             # Logger parameters
+             exp_name='lstm_td3',
+             data_dir='spinup_data_lstm_gate',
              logger_kwargs=dict(), save_freq=1):
     """
     Twin Delayed Deep Deterministic Policy Gradient (TD3)
@@ -466,8 +1157,17 @@ def lstm_td3(resume_exp_dir=None,
             policy at the end of each epoch.
 
         max_ep_len (int): Maximum length of trajectory / episode / rollout.
+        
+        use_beam_env (bool): Use beam environment instead of bullet environment.
+        
+        optimal_phases_path (str): Path to optimal phases pickle file for beam environment.
+        
+        exp_name (str): Experiment name for logging.
+        
+        data_dir (str): Directory for saving experiment data.
 
-        logger_kwargs (dict): Keyword args for EpochLogger.
+        logger_kwargs (dict): Keyword args for EpochLogger. If empty, will be 
+            automatically generated using exp_name, seed, and data_dir.
 
         save_freq (int): How often (in terms of gap between epochs) to save
             the current policy and value function.
@@ -475,6 +1175,9 @@ def lstm_td3(resume_exp_dir=None,
     """
     # If not going to resume, create new logger.
     if resume_exp_dir is None:
+        # Set up logger kwargs if not provided
+        if not logger_kwargs:
+            logger_kwargs = setup_logger_kwargs(exp_name, seed, data_dir, datestamp=True)
         logger = EpochLogger(**logger_kwargs)
         logger.save_config(locals())
     else:
@@ -483,8 +1186,14 @@ def lstm_td3(resume_exp_dir=None,
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # Wrapper environment if using POMDP
-    if partially_observable:
+    # Environment creation - support both beam and bullet environments
+    if use_beam_env:
+        # Create beam environment
+        env = make_beam_env(optimal_phases_path, max_ep_len)
+        test_env = _make_test_gym_env(optimal_phases_path, max_ep_len)
+        print(f"Created beam environment with observation space: {env.observation_space}")
+        print(f"Created beam environment with action space: {env.action_space}")
+    elif partially_observable:
         env = POMDPWrapper(env_name, pomdp_type, flicker_prob, random_noise_sigma, random_sensor_missing_prob)
         test_env = POMDPWrapper(env_name, pomdp_type, flicker_prob, random_noise_sigma, random_sensor_missing_prob)
     else:
@@ -643,8 +1352,10 @@ def lstm_td3(resume_exp_dir=None,
         return np.clip(a, -act_limit, act_limit)
 
     def test_agent():
+        test_returns = []
         for j in range(num_test_episodes):
-            o, d, ep_ret, ep_len = test_env.reset(), False, 0, 0
+            o, _ = test_env.reset()
+            d, ep_ret, ep_len = False, 0, 0
 
             if max_hist_len > 0:
                 o_buff = np.zeros([max_hist_len, obs_dim])
@@ -659,7 +1370,8 @@ def lstm_td3(resume_exp_dir=None,
             while not (d or (ep_len == max_ep_len)):
                 # Take deterministic actions at test time (noise_scale=0)
                 a = get_action(o, o_buff, a_buff, o_buff_len, 0, device)
-                o2, r, d, _ = test_env.step(a)
+                o2, r, terminated, truncated, info = test_env.step(a)
+                d = terminated or truncated
 
                 ep_ret += r
                 ep_len += 1
@@ -676,14 +1388,25 @@ def lstm_td3(resume_exp_dir=None,
                         o_buff_len += 1
                 o = o2
 
+            test_returns.append(ep_ret)
             logger.store(TestEpRet=ep_ret, TestEpLen=ep_len)
+        
+        # Return average test performance for best model tracking
+        return np.mean(test_returns)
 
     # Prepare for interaction with environment
 
     total_steps = steps_per_epoch * epochs
     start_time = time.time()
     past_t = 0
-    o, ep_ret, ep_len = env.reset(), 0, 0
+    o, _ = env.reset()
+    ep_ret, ep_len = 0, 0
+    
+    # Best model tracking
+    if resume_exp_dir is None:
+        best_test_ret = float('-inf')
+        best_model_saved = False
+    # else: best_test_ret is set in resume section above
 
     if max_hist_len > 0:
         o_buff = np.zeros([max_hist_len, obs_dim])
@@ -696,25 +1419,50 @@ def lstm_td3(resume_exp_dir=None,
         o_buff_len = 0
 
     if resume_exp_dir is not None:
-        # Find the latest checkpoint
+        # Load the best model checkpoint
         resume_checkpoint_path = osp.join(resume_exp_dir, "pyt_save")
-        checkpoint_files = os.listdir(resume_checkpoint_path)
-        latest_context_version = np.max([int(f_name.split('-')[3]) for f_name in checkpoint_files if
-                                         'context' in f_name and 'verified' in f_name])
-        latest_model_version = np.max([int(f_name.split('-')[3]) for f_name in checkpoint_files if
-                                       'model' in f_name and 'verified' in f_name])
-        if latest_context_version != latest_model_version:
-            latest_version = np.min([latest_context_version, latest_model_version])
+        
+        # Try new format first (best-model.pt, best-context.pt)
+        best_context_path = osp.join(resume_checkpoint_path, 'best-context.pt')
+        best_model_path = osp.join(resume_checkpoint_path, 'best-model.pt')
+        
+        if osp.exists(best_context_path) and osp.exists(best_model_path):
+            # New format - load best model
+            print("Loading from best model checkpoints...")
+            context_checkpoint = torch.load(best_context_path)
+            model_checkpoint = torch.load(best_model_path)
+            
+            # Restore best model tracking
+            best_test_ret = context_checkpoint.get('best_test_ret', float('-inf'))
+            best_model_saved = True  # We have a saved best model
+            print(f"Resuming from best model with test return: {best_test_ret:.3f}")
+            
         else:
-            latest_version = latest_context_version
-        latest_context_checkpoint_file_name = 'checkpoint-context-Step-{}-verified.pt'.format(latest_version)
-        latest_model_checkpoint_file_name = 'checkpoint-model-Step-{}-verified.pt'.format(latest_version)
-        latest_context_checkpoint_file_path = osp.join(resume_checkpoint_path, latest_context_checkpoint_file_name)
-        latest_model_checkpoint_file_path = osp.join(resume_checkpoint_path, latest_model_checkpoint_file_name)
-
-        # Load the latest checkpoint
-        context_checkpoint = torch.load(latest_context_checkpoint_file_path)
-        model_checkpoint = torch.load(latest_model_checkpoint_file_path)
+            # Fallback to old format for backward compatibility
+            print("Loading from old format checkpoints...")
+            checkpoint_files = os.listdir(resume_checkpoint_path)
+            
+            # Find latest checkpoint files with step numbers
+            context_files = [f for f in checkpoint_files if 'context' in f and 'verified' in f]
+            model_files = [f for f in checkpoint_files if 'model' in f and 'verified' in f]
+            
+            if not context_files or not model_files:
+                raise FileNotFoundError("No valid checkpoint files found")
+            
+            # Get latest versions
+            latest_context_version = max([int(f.split('-')[3]) for f in context_files])
+            latest_model_version = max([int(f.split('-')[3]) for f in model_files])
+            latest_version = min(latest_context_version, latest_model_version)
+            
+            latest_context_file = f'checkpoint-context-Step-{latest_version}-verified.pt'
+            latest_model_file = f'checkpoint-model-Step-{latest_version}-verified.pt'
+            
+            context_checkpoint = torch.load(osp.join(resume_checkpoint_path, latest_context_file))
+            model_checkpoint = torch.load(osp.join(resume_checkpoint_path, latest_model_file))
+            
+            # No best tracking in old format
+            best_test_ret = float('-inf')
+            best_model_saved = False
 
         # Restore experiment context
         logger.epoch_dict = context_checkpoint['logger_epoch_dict']
@@ -730,7 +1478,7 @@ def lstm_td3(resume_exp_dir=None,
 
     print("past_t={}".format(past_t))
     # Main loop: collect experience in env and update/log each epoch
-    for t in range(past_t, total_steps):  # Start from the step after resuming.
+    for t in tqdm(range(past_t, total_steps)):  # Start from the step after resuming.
         # Until start_steps have elapsed, randomly sample actions
         # from a uniform distribution for better exploration. Afterwards,
         # use the learned policy (with some noise, via act_noise).
@@ -740,7 +1488,8 @@ def lstm_td3(resume_exp_dir=None,
             a = env.action_space.sample()
 
         # Step the env
-        o2, r, d, _ = env.step(a)
+        o2, r, terminated, truncated, info = env.step(a)
+        d = terminated or truncated
 
         ep_ret += r
         ep_len += 1
@@ -772,7 +1521,8 @@ def lstm_td3(resume_exp_dir=None,
         # End of trajectory handling
         if d or (ep_len == max_ep_len):
             logger.store(EpRet=ep_ret, EpLen=ep_len)
-            o, ep_ret, ep_len = env.reset(), 0, 0
+            o, _ = env.reset()
+            ep_ret, ep_len = 0, 0
 
             if max_hist_len > 0:
                 o_buff = np.zeros([max_hist_len, obs_dim])
@@ -784,38 +1534,7 @@ def lstm_td3(resume_exp_dir=None,
                 a_buff = np.zeros([1, act_dim])
                 o_buff_len = 0
 
-            # Store checkpoint at the end of trajectory, so there is no need to store env as resume env in PyBullet is problematic.
-            # Save the context of the learning and learned models
-            fpath = 'pyt_save'
-            fpath = osp.join(logger.output_dir, fpath)
-            os.makedirs(fpath, exist_ok=True)
-            old_checkpoints = os.listdir(fpath)  # Cache old checkpoints to delete later
-            # Separately save context and model to reduce disk space usage.
-            context_fname = 'checkpoint-context-' + (
-                'Step-%d' % t if t is not None else '') + '.pt'
-            model_fname = 'checkpoint-model-' + ('Step-%d' % t if t is not None else '') + '.pt'
-
-            context_elements = {'env': env, 'replay_buffer': replay_buffer,
-                                'logger_epoch_dict': logger.epoch_dict,
-                                'start_time': start_time, 't': t}
-            model_elements = {'ac_state_dict': ac.state_dict(),
-                              'target_ac_state_dict': ac_targ.state_dict(),
-                              'pi_optimizer_state_dict': pi_optimizer.state_dict(),
-                              'q_optimizer_state_dict': q_optimizer.state_dict()}
-            context_fname = osp.join(fpath, context_fname)
-            torch.save(context_elements, context_fname)
-            model_fname = osp.join(fpath, model_fname)
-            torch.save(model_elements, model_fname)
-            # Rename the file to verify the completion of the saving.
-            verified_context_fname = osp.join(fpath, 'checkpoint-context-' + (
-                'Step-%d' % t if t is not None else '') + '-verified.pt')
-            verified_model_fname = osp.join(fpath, 'checkpoint-model-' + (
-                'Step-%d' % t if t is not None else '') + '-verified.pt')
-            os.rename(context_fname, verified_context_fname)
-            os.rename(model_fname, verified_model_fname)
-            # Remove old checkpoint
-            for old_f in old_checkpoints:
-                os.remove(osp.join(fpath, old_f))
+            # Checkpoint saving moved to end of epoch after test evaluation
 
         # Update handling
         if t >= update_after and t % update_every == 0:
@@ -827,8 +1546,57 @@ def lstm_td3(resume_exp_dir=None,
         # End of epoch handling
         if (t + 1) % steps_per_epoch == 0:
             epoch = (t + 1) // steps_per_epoch
+            
             # Test the performance of the deterministic version of the agent.
-            test_agent()
+            current_test_ret = test_agent()
+            
+            # Save best model only when test performance improves
+            if current_test_ret > best_test_ret:
+                best_test_ret = current_test_ret
+                best_model_saved = True
+                
+                print(f"\n🎯 NEW BEST MODEL! Test return: {best_test_ret:.3f} (Epoch {epoch})")
+                
+                # Save the best model and context (overwrite previous)
+                fpath = '/afs/cern.ch/work/a/apastina/DatasetGen/datasetgenerator/lstm_td3_beam_logs/pyt_save'
+                # fpath = osp.join(logger.output_dir, fpath)
+                os.makedirs(fpath, exist_ok=True)
+                
+                # Simple filenames without step numbers - will overwrite previous best
+                context_fname = osp.join(fpath, 'best-context.pt')
+                model_fname = osp.join(fpath, 'best-model.pt')
+                
+                # Save context elements for the best model
+                context_elements = {
+                    'env': env, 
+                    'replay_buffer': replay_buffer,
+                    'logger_epoch_dict': logger.epoch_dict,
+                    'start_time': start_time, 
+                    't': t,
+                    'epoch': epoch,
+                    'best_test_ret': best_test_ret
+                }
+                
+                # Save model elements
+                model_elements = {
+                    'ac_state_dict': ac.state_dict(),
+                    'target_ac_state_dict': ac_targ.state_dict(),
+                    'pi_optimizer_state_dict': pi_optimizer.state_dict(),
+                    'q_optimizer_state_dict': q_optimizer.state_dict(),
+                    'epoch': epoch,
+                    'best_test_ret': best_test_ret,
+                    'total_steps': t
+                }
+                
+                # Save files
+                torch.save(context_elements, context_fname)
+                torch.save(model_elements, model_fname)
+                
+                context_size_mb = osp.getsize(context_fname) / (1024**2)
+                model_size_mb = osp.getsize(model_fname) / (1024**2)
+                print(f"   💾 Saved - Context: {context_size_mb:.1f}MB, Model: {model_size_mb:.1f}MB")
+            else:
+                print(f"   Test return: {current_test_ret:.3f} (Best: {best_test_ret:.3f})")
 
             # Log info about epoch
             logger.log_tabular('Epoch', epoch)
@@ -837,13 +1605,48 @@ def lstm_td3(resume_exp_dir=None,
             logger.log_tabular('EpLen', average_only=True)
             logger.log_tabular('TestEpLen', average_only=True)
             logger.log_tabular('TotalEnvInteracts', t)
-            logger.log_tabular('Q1Vals', with_min_and_max=True)
-            logger.log_tabular('Q2Vals', with_min_and_max=True)
-            logger.log_tabular('Q1ExtractedMemory', with_min_and_max=True)
-            logger.log_tabular('Q2ExtractedMemory', with_min_and_max=True)
-            logger.log_tabular('ActExtractedMemory', with_min_and_max=True)
-            logger.log_tabular('LossPi', average_only=True)
-            logger.log_tabular('LossQ', average_only=True)
+            logger.log_tabular('BestTestRet', best_test_ret)  # Track best performance
+            
+            # Always log training metrics (use NaN if not available to maintain consistent headers)
+            if 'Q1Vals' in logger.epoch_dict and len(logger.epoch_dict['Q1Vals']) > 0:
+                logger.log_tabular('Q1Vals', with_min_and_max=True)
+                logger.log_tabular('Q2Vals', with_min_and_max=True)
+                logger.log_tabular('Q1ExtractedMemory', with_min_and_max=True)
+                logger.log_tabular('Q2ExtractedMemory', with_min_and_max=True)
+                logger.log_tabular('LossQ', average_only=True)
+            else:
+                # Log NaN values to maintain consistent headers before training starts
+                logger.log_tabular('AverageQ1Vals', np.nan)
+                logger.log_tabular('StdQ1Vals', np.nan)
+                logger.log_tabular('MaxQ1Vals', np.nan)
+                logger.log_tabular('MinQ1Vals', np.nan)
+                logger.log_tabular('AverageQ2Vals', np.nan)
+                logger.log_tabular('StdQ2Vals', np.nan)
+                logger.log_tabular('MaxQ2Vals', np.nan)
+                logger.log_tabular('MinQ2Vals', np.nan)
+                logger.log_tabular('AverageQ1ExtractedMemory', np.nan)
+                logger.log_tabular('StdQ1ExtractedMemory', np.nan)
+                logger.log_tabular('MaxQ1ExtractedMemory', np.nan)
+                logger.log_tabular('MinQ1ExtractedMemory', np.nan)
+                logger.log_tabular('AverageQ2ExtractedMemory', np.nan)
+                logger.log_tabular('StdQ2ExtractedMemory', np.nan)
+                logger.log_tabular('MaxQ2ExtractedMemory', np.nan)
+                logger.log_tabular('MinQ2ExtractedMemory', np.nan)
+                logger.log_tabular('LossQ', np.nan)
+                
+            # Actor metrics are updated less frequently (every policy_delay steps)
+            if 'ActExtractedMemory' in logger.epoch_dict and len(logger.epoch_dict['ActExtractedMemory']) > 0:
+                logger.log_tabular('ActExtractedMemory', with_min_and_max=True)
+            else:
+                logger.log_tabular('AverageActExtractedMemory', np.nan)
+                logger.log_tabular('StdActExtractedMemory', np.nan)
+                logger.log_tabular('MaxActExtractedMemory', np.nan)
+                logger.log_tabular('MinActExtractedMemory', np.nan)
+                
+            if 'LossPi' in logger.epoch_dict and len(logger.epoch_dict['LossPi']) > 0:
+                logger.log_tabular('LossPi', average_only=True)
+            else:
+                logger.log_tabular('LossPi', np.nan)
 
             logger.log_tabular('Time', time.time() - start_time)
             logger.dump_tabular()
@@ -898,6 +1701,8 @@ if __name__ == '__main__':
     parser.add_argument('--actor_cur_feature_hid_sizes', type=int, nargs="?", default=[128, 128])
     parser.add_argument('--actor_post_comb_hid_sizes', type=int, nargs="+", default=[128])
     parser.add_argument('--actor_hist_with_past_act', type=str2bool, nargs='?', const=True, default=True)
+    parser.add_argument('--use_beam_env', type=str2bool, nargs='?', const=True, default=False, help="Use beam environment instead of bullet tasks")
+    parser.add_argument('--optimal_phases_path', type=str, default='', help="Path to optimal phases pickle file for beam environment")
     parser.add_argument('--exp_name', type=str, default='lstm_td3')
     parser.add_argument("--data_dir", type=str, default='spinup_data_lstm_gate')
     args = parser.parse_args()
@@ -909,19 +1714,8 @@ if __name__ == '__main__':
         args.actor_cur_feature_hid_sizes = []
 
 
-    # Set log data saving directory
-    if args.resume_exp_dir is None:
-        # data_dir = osp.join(
-        #     osp.dirname(osp.dirname(osp.dirname(osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__))))))),
-        #     args.data_dir)
-        # data_dir = osp.join(
-        #         osp.dirname('/scratch/lingheng/'),
-        #         args.data_dir)
-        data_dir = osp.join(
-            osp.dirname('F:/scratch/lingheng/'),
-            args.data_dir)
-        logger_kwargs = setup_logger_kwargs(args.exp_name, args.seed, data_dir, datestamp=True)
-    else:
+    # Handle resuming experiment
+    if args.resume_exp_dir is not None:
         # Load config_json
         resume_exp_dir = args.resume_exp_dir
         config_path = osp.join(args.resume_exp_dir, 'config.json')
@@ -937,6 +1731,12 @@ if __name__ == '__main__':
         logger_kwargs = config_json["logger_kwargs"]   # Restore logger_kwargs
         config_json.pop('logger', None)                # Remove logger from config_json
         args = json.loads(json.dumps(config_json), object_hook=lambda d: namedtuple('args', d.keys())(*d.values()))
+    else:
+        # Set default data directory for new experiments
+        args.data_dir = osp.join(
+            osp.dirname('/afs/cern.ch/work/a/apastina/DatasetGen/datasetgenerator/lstm_td3_logs'),
+            args.data_dir)
+        logger_kwargs = {}
 
 
     lstm_td3(resume_exp_dir=args.resume_exp_dir,
@@ -961,4 +1761,8 @@ if __name__ == '__main__':
              actor_cur_feature_hid_sizes=tuple(args.actor_cur_feature_hid_sizes),
              actor_post_comb_hid_sizes=tuple(args.actor_post_comb_hid_sizes),
              actor_hist_with_past_act=args.actor_hist_with_past_act,
-             logger_kwargs=logger_kwargs)
+             use_beam_env=args.use_beam_env,
+             optimal_phases_path=args.optimal_phases_path,
+             exp_name=args.exp_name,
+             data_dir=args.data_dir,
+             logger_kwargs=logger_kwargs if args.resume_exp_dir else {})

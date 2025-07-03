@@ -1,0 +1,46 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+Context & System Overview
+- Domain: Particle accelerator physics, specifically synchrotron accelerators like the Proton Synchrotron Booster (PSB) at CERN
+- System: Double-harmonic RF cavity system with 1st harmonic (h=1) and 2nd harmonic (h=2) operating simultaneously
+- Key Variables:
+- - Φ₂: Phase of the 2nd harmonic relative to the 1st harmonic (primary optimization variable)
+- - V_t: Total voltage in the cavity (V1 + V2)
+- - r = V₂/V₁: Voltage ratio between 2nd and 1st harmonic
+- - ff: Filling factor of the particle distribution in the separatrix (doesn't change the potential well but changes how the profiles look)
+- - φₛ: Synchronous phase angle (indicates how much the system is accelerating)
+Core Physics Problem
+- The accelerator uses RF cavities to accelerate charged particle beams through oscillating electric fields. In double-harmonic operation:
+- - Single-harmonic limitations: Creates asymmetric potential wells, leading to non-uniform particle distributions
+- - Double-harmonic benefits: Allows creation of flatter, more symmetric beam profiles through proper phasing
+- Operating modes:
+- - BSM (Bunch Shortening Mode): Φ₂ = π (with no other effects or imperfections)
+- - BLM (Bunch Lengthening Mode): Φ₂ = 0 (with no other effects or imperfections)
+
+Collective Effects & Instabilities
+- Three main collective effects destabilize the beam:
+- - Space Charge: Coulomb repulsion between particles causes beam spreading, more severe at low energies
+- - Resistive Wall Impedance: Beam interaction with conducting vacuum chamber walls
+- - Cavity Impedance/Beam Loading: Beam-induced electromagnetic fields in RF cavities
+- These effects cause:
+- - Beam profile asymmetry and non-uniform charge density (λφ)
+- - Energy spread increase
+- - Potential beam loss and instabilities
+- - Reduced beam intensity capabilities
+
+Solution Approach: 2nd Harmonic Phasing
+- Goal: Optimize Φ₂ throughout the acceleration cycle to:
+- - Flatten the longitudinal beam profile and make it as uniform as possible(line density λφ)
+- - Minimize space charge effects by reducing dλφ/dt
+- - Compensate for beam loading effects
+- - Maintain symmetric separatrix and potential wells
+- - Prevent beam instabilities and losses
+
+Technical Implementation
+- Simulation Tool: BLonD (Beam Longitudinal Dynamics) code
+
+Problem Statement
+- Design and verify an automated optimizer to compute the correct phase of the second harmonic Φ₂ throughout the acceleration cycle to compensate for space charge and beam loading effects, maintaining beam stability and optimal longitudinal profile characteristics.

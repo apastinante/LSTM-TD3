@@ -292,7 +292,7 @@ class BeamEnvironmentFixed:
         self.progress_coeff = 1.0        # Progress reward (was 20.0!)
         self.action_penalty_coeff = 0.1  # Action penalty (was 0.5)
         self.convergence_bonus = 20.0    # Convergence bonus (was 100)
-        self.smart_adjustment_bonus = 10.0 # Smart adjustment bonus (was 50)
+        self.smart_adjustment_bonus = 1.0 # Smart adjustment bonus (was 50)
 
     def reset(self, seed=None):
         if seed is not None:
@@ -347,7 +347,19 @@ class BeamEnvironmentFixed:
     def step(self, action):
         """FIXED REWARD FUNCTION - Much more stable"""
         prev_dist = self.current_rel_dist
+        prev_dist_w_sign = self.current_dist_w_sign
+
+        # First give the rewards that are based on the previous state and the action taken in the current step
+        # 1. Smart adjustment bonus - only for fine corrections
+        smart_bonus = 0
+        if (self.current_rel_dist <= 5 * np.pi / 180 and # Close to convergence
+            abs(action) <= self.current_rel_dist and # Action is not too large
+            abs(action) >= 0.5*self.current_rel_dist and # Action is not too small
+            np.sign(action) == np.sign(self.current_dist_w_sign)): # Action is in the right direction
+            smart_bonus = self.smart_adjustment_bonus / ((1 + abs(self.current_rel_dist-abs(action)) * 180/np.pi)*(self.steps+1)) 
+
         
+
         # Apply phase adjustment
         new_phase_rel = self._phase_wrap(self.current_phase_rel + action)
         
@@ -363,7 +375,7 @@ class BeamEnvironmentFixed:
         # Calculate new distance
         self.current_rel_dist = cyclic_distance(self.optimal_phase_rel, new_phase_rel)
         self.current_dist_w_sign = cyclic_distance_w_sign(self.optimal_phase_rel, new_phase_rel)
-        self.best_dist = min(self.best_dist, self.current_rel_dist)
+        # self.best_dist = min(self.best_dist, self.current_rel_dist)
         
         # STABILIZED REWARD COMPONENTS
         
@@ -377,20 +389,20 @@ class BeamEnvironmentFixed:
         # 3. Gentle action penalty
         action_penalty = -self.action_penalty_coeff * (abs(action) / np.pi)
         
-        # 4. Smart adjustment bonus - only for fine corrections
-        smart_bonus = 0
-        if (self.current_rel_dist <= 5 * np.pi / 180 and 
-            abs(action) <= self.current_rel_dist and 
-            np.sign(action) == np.sign(self.current_dist_w_sign)):
-            smart_bonus = self.smart_adjustment_bonus / ((1 + (self.current_rel_dist-abs(action)) * 180/np.pi)*(self.steps+1)) 
+        # 4. If close to convergence, and we stay there, give a bonus
+        convergence_bonus_staying = 0
+        if (self.current_rel_dist < (np.pi * 0.5 / 180) and # Very close to convergence after the action
+            np.sign(action) == np.sign(prev_dist_w_sign) and # Action was in the right direction 
+            abs(action) <= prev_dist):  # Action was not too large (we dont care about small actions very close to convergence)
+            convergence_bonus_staying = self.convergence_bonus * np.exp(-self.current_rel_dist * 10)
         
-        # 5. Smooth convergence bonus
-        convergence_bonus = 0
-        if self.current_rel_dist < (np.pi * 0.5 / 180):  # Within 0.5 degrees
-            convergence_bonus = self.convergence_bonus * np.exp(-self.current_rel_dist * 10)
+        # 4. Smooth convergence bonus
+        # convergence_bonus = 0
+        # if self.current_rel_dist < (np.pi * 0.5 / 180):  # Within 0.5 degrees
+        #     convergence_bonus = self.convergence_bonus * np.exp(-self.current_rel_dist * 10)
         
         # Combine rewards
-        reward = distance_reward + progress_reward + action_penalty + smart_bonus + convergence_bonus - simulation_penalty
+        reward = distance_reward + progress_reward + action_penalty + smart_bonus + convergence_bonus_staying - simulation_penalty
         
         # Update state
         self.current_phase_rel = new_phase_rel
@@ -398,7 +410,7 @@ class BeamEnvironmentFixed:
         self.steps += 1
 
         # Termination
-        done_convergence = self.current_rel_dist < (np.pi * 0.5 / 180)
+        done_convergence = False # self.current_rel_dist < (np.pi * 0.5 / 180)
         done_steps = self.steps >= self.max_steps
         done = done_convergence or done_steps
 
@@ -476,7 +488,7 @@ class TestBeamEnvironment:
         self.progress_coeff = 1.0        # Progress reward (was 20.0!)
         self.action_penalty_coeff = 0.1  # Action penalty (was 0.5)
         self.convergence_bonus = 20.0    # Convergence bonus (was 100)
-        self.smart_adjustment_bonus = 10.0 # Smart adjustment bonus (was 50)
+        self.smart_adjustment_bonus = 1.0 # Smart adjustment bonus (was 50)
 
     def reset(self,seed = None):
         self.seed = seed
@@ -555,7 +567,19 @@ class TestBeamEnvironment:
     def step(self, action):
         """FIXED REWARD FUNCTION - Much more stable"""
         prev_dist = self.current_rel_dist
+        prev_dist_w_sign = self.current_dist_w_sign
+
+        # First give the rewards that are based on the previous state and the action taken in the current step
+        # 1. Smart adjustment bonus - only for fine corrections
+        smart_bonus = 0
+        if (self.current_rel_dist <= 5 * np.pi / 180 and # Close to convergence
+            abs(action) <= self.current_rel_dist and # Action is not too large
+            abs(action) >= 0.5*self.current_rel_dist and # Action is not too small
+            np.sign(action) == np.sign(self.current_dist_w_sign)): # Action is in the right direction
+            smart_bonus = self.smart_adjustment_bonus / ((1 + abs(self.current_rel_dist-abs(action)) * 180/np.pi)*(self.steps+1)) 
+
         
+
         # Apply phase adjustment
         new_phase_rel = self._phase_wrap(self.current_phase_rel + action)
         
@@ -585,20 +609,20 @@ class TestBeamEnvironment:
         # 3. Gentle action penalty
         action_penalty = -self.action_penalty_coeff * (abs(action) / np.pi)
         
-        # 4. Smart adjustment bonus - only for fine corrections
-        smart_bonus = 0
-        if (self.current_rel_dist <= 5 * np.pi / 180 and 
-            abs(action) <= self.current_rel_dist and 
-            np.sign(action) == np.sign(self.current_dist_w_sign)):
-            smart_bonus = self.smart_adjustment_bonus / ((1 + (self.current_rel_dist-abs(action)) * 180/np.pi)*(self.steps+1)) 
+        # 4. If close to convergence, and we stay there, give a bonus
+        convergence_bonus_staying = 0
+        if (self.current_rel_dist < (np.pi * 0.5 / 180) and # Very close to convergence after the action
+            np.sign(action) == np.sign(prev_dist_w_sign) and # Action was in the right direction 
+            abs(action) <= prev_dist):  # Action was not too large (we dont care about small actions very close to convergence)
+            convergence_bonus_staying = self.convergence_bonus * np.exp(-self.current_rel_dist * 10)
         
-        # 5. Smooth convergence bonus
-        convergence_bonus = 0
-        if self.current_rel_dist < (np.pi * 0.5 / 180):  # Within 0.5 degrees
-            convergence_bonus = self.convergence_bonus * np.exp(-self.current_rel_dist * 10)
+        # 4. Smooth convergence bonus
+        # convergence_bonus = 0
+        # if self.current_rel_dist < (np.pi * 0.5 / 180):  # Within 0.5 degrees
+        #     convergence_bonus = self.convergence_bonus * np.exp(-self.current_rel_dist * 10)
         
         # Combine rewards
-        reward = distance_reward + progress_reward + action_penalty + smart_bonus + convergence_bonus - simulation_penalty
+        reward = distance_reward + progress_reward + action_penalty + smart_bonus + convergence_bonus_staying - simulation_penalty
         
         # Update state
         self.current_phase_rel = new_phase_rel
@@ -606,7 +630,7 @@ class TestBeamEnvironment:
         self.steps += 1
 
         # Termination
-        done_convergence = self.current_rel_dist < (np.pi * 0.5 / 180)
+        done_convergence = False # self.current_rel_dist < (np.pi * 0.5 / 180)
         done_steps = self.steps >= self.max_steps
         done = done_convergence or done_steps
 
@@ -703,24 +727,43 @@ def make_beam_env(optimal_phases_path, max_ep_len):
 
 class RenderingCallback:
     """Callback to generate GIFs during training showing agent behavior"""
-    def __init__(self, test_env, render_freq=100000, save_path="./training_gifs/", verbose=0):
+    def __init__(self, test_env, render_freq=500, 
+    save_path="/afs/cern.ch/work/a/apastina/DatasetGen/datasetgenerator/training_gifs/",
+     max_hist_len=10, verbose=0, 
+     act_dim=1,
+     obs_dim=1001,
+     act_limit=np.pi/4):
         self.test_env = test_env
         self.render_freq = render_freq
         self.save_path = save_path
         self.gif_counter = 0
         self.verbose = verbose
-        
+        self.max_hist_len = max_hist_len
+        self.act_dim = act_dim
+        self.obs_dim = obs_dim
+        self.act_limit = act_limit
         # Create directory if it doesn't exist
         os.makedirs(save_path, exist_ok=True)
         
-    def should_render(self, timestep):
+    def should_render(self, epoch):
         """Check if it's time to render"""
-        return timestep % self.render_freq == 0 and timestep > 0
+        return epoch % self.render_freq == 0 and epoch > 0
     
-    def generate_training_gif(self, model, timestep, device):
+    def get_action(self, o, o_buff, a_buff, o_buff_len, noise_scale, ac, device=None):
+        h_o = torch.tensor(o_buff).view(1, o_buff.shape[0], o_buff.shape[1]).float().to(device)
+        h_a = torch.tensor(a_buff).view(1, a_buff.shape[0], a_buff.shape[1]).float().to(device)
+        h_l = torch.tensor([o_buff_len]).float().to(device)
+        with torch.no_grad():
+            a = ac.act(torch.as_tensor(o, dtype=torch.float32).view(1, -1).to(device),
+                       h_o, h_a, h_l).reshape(self.act_dim)
+        a += noise_scale * np.random.randn(self.act_dim)
+        return np.clip(a, -self.act_limit, self.act_limit)
+
+    
+    def generate_training_gif(self, ac, epoch, device):
         """Generate a GIF showing agent behavior during an episode"""
         if self.verbose > 0:
-            print(f"Generating training GIF at step {timestep}...")
+            print(f"Generating training GIF at step {epoch}...")
         
         # Reset environment
         obs, _ = self.test_env.reset()
@@ -733,9 +776,9 @@ class RenderingCallback:
         rewards = []
         
         # Initialize history buffers (same as in test_agent)
-        obs_dim = len(obs)
-        act_dim = model.pi.act_dim
-        max_hist_len = 5  # This should match the model's expectation
+        obs_dim = self.obs_dim
+        act_dim = self.act_dim
+        max_hist_len = self.max_hist_len  # This should match the model's expectation
         
         if max_hist_len > 0:
             o_buff = np.zeros([max_hist_len, obs_dim])
@@ -749,17 +792,8 @@ class RenderingCallback:
         
         while not done and step < 30:  # Max 30 steps
             # Get action from model (same as get_action function)
-            h_o = torch.tensor(o_buff).view(1, o_buff.shape[0], o_buff.shape[1]).float().to(device)
-            h_a = torch.tensor(a_buff).view(1, a_buff.shape[0], a_buff.shape[1]).float().to(device)
-            h_l = torch.tensor([o_buff_len]).float().to(device)
-            
-            with torch.no_grad():
-                action = model.act(torch.as_tensor(obs, dtype=torch.float32).view(1, -1).to(device),
-                                 h_o, h_a, h_l).reshape(act_dim)
-            
-            # Convert to numpy and clip
-            action = np.clip(action.cpu().numpy(), -np.pi/4, np.pi/4)  # Match action space limits
-            actions_taken.append(float(action[0]))
+            action = self.get_action(obs, o_buff, a_buff, o_buff_len, 0, ac, device)
+            actions_taken.append(float(action))
             
             # Take step
             obs2, reward, terminated, truncated, info = self.test_env.step(action)
@@ -777,7 +811,7 @@ class RenderingCallback:
                 phase_errors.append(0)
             
             # Create frame
-            frame = self._create_frame(obs, step, actions_taken, phase_errors, rewards, done, timestep)
+            frame = self._create_frame(obs, step, actions_taken, phase_errors, rewards, done, epoch)
             frames.append(frame)
             
             # Update history buffers
@@ -796,14 +830,14 @@ class RenderingCallback:
             step += 1
         
         # Save GIF
-        gif_path = os.path.join(self.save_path, f"training_step_{timestep:08d}_{self.gif_counter:02d}.gif")
+        gif_path = os.path.join(self.save_path, f"training_step_{epoch:08d}_{self.gif_counter:02d}.gif")
         imageio.mimsave(gif_path, frames, fps=2, duration=0.5)
         if self.verbose > 0:
             print(f"Saved training GIF: {gif_path}")
         
         self.gif_counter += 1
     
-    def _create_frame(self, obs, step, actions, phase_errors, rewards, done, timestep):
+    def _create_frame(self, obs, step, actions, phase_errors, rewards, done, epoch):
         """Create a single frame showing beam profile and metrics"""
         # Extract beam profile and phi_s from observation
         beam_profile = obs[:1000]  # First 1000 elements
@@ -821,10 +855,10 @@ class RenderingCallback:
         ax1.grid(True, alpha=0.3)
         
         # Add convergence status
-        if done and len(phase_errors) > 0:
-            status = "CONVERGED" if phase_errors[-1] < 0.5 else "MAX STEPS"
+        if (done and len(phase_errors) > 0) or (len(phase_errors) > 0 and phase_errors[-1] < 0.5):
+            status = "CONVERGING" if phase_errors[-1] < 0.5 else "MAX STEPS"
             ax1.text(0.02, 0.95, status, transform=ax1.transAxes, 
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor="green" if status == "CONVERGED" else "red", alpha=0.7),
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="green" if status == "CONVERGING" else "red", alpha=0.7),
                     fontsize=10, fontweight='bold', color='white')
         
         # Plot 2: Actions taken
@@ -875,7 +909,7 @@ class RenderingCallback:
             ax4.set_title('Rewards')
         
         # Add overall title
-        fig.suptitle(f'LSTM-TD3 Agent Training Progress - Timestep {timestep:,}\n'
+        fig.suptitle(f'LSTM-TD3 Agent Training Progress - Timestep {epoch:,}\n'
                     f'Synchronous Phase: {phi_s:.3f}π', fontsize=14, fontweight='bold')
         
         plt.tight_layout()
@@ -884,8 +918,8 @@ class RenderingCallback:
         fig.canvas.draw()
         width, height = fig.canvas.get_width_height()
         img = np.frombuffer(fig.canvas.tostring_argb(), dtype='uint8').reshape(height, width, 4)
+        img = img[..., 1:]
         plt.close(fig)
-        img = img[:, :, 1:]
         return img
 
 
@@ -1259,7 +1293,9 @@ def lstm_td3(resume_exp_dir=None,
              use_tensorboard=False,
              tensorboard_log_freq=100,
              # Rendering parameters
-             render_freq=0):
+             render_freq=0,
+             # Testing parameters  
+             test_freq=10):
     """
     Twin Delayed Deep Deterministic Policy Gradient (TD3)
 
@@ -1364,6 +1400,12 @@ def lstm_td3(resume_exp_dir=None,
 
         save_freq (int): How often (in terms of gap between epochs) to save
             the current policy and value function.
+        
+        use_tensorboard (bool): Whether to use TensorBoard for logging.
+                
+        render_freq (int): How often (in terms of gap between steps) to render the environment.
+        
+        test_freq (int): How often (in terms of gap between epochs) to run test episodes.
 
     """
     # Setup output directory and configuration saving
@@ -1407,25 +1449,7 @@ def lstm_td3(resume_exp_dir=None,
             tensorboard_writer = None
             use_tensorboard = False
     
-    # Initialize rendering callback if enabled
-    rendering_callback = None
-    if render_freq > 0 and use_beam_env:
-        try:
-            gif_save_path = osp.join(output_dir, 'training_gifs')
-            rendering_callback = RenderingCallback(
-                test_env=None,  # Will be set after environment creation
-                render_freq=render_freq,
-                save_path=gif_save_path,
-                verbose=1
-            )
-            print(f"Rendering callback enabled: frequency={render_freq}, save_path={gif_save_path}")
-        except Exception as e:
-            print(f"Warning: Could not initialize rendering callback: {e}")
-            rendering_callback = None
-    elif render_freq > 0 and not use_beam_env:
-        print("Warning: Rendering callback only supported for beam environments")
-        rendering_callback = None
-
+    
     # Initialize epoch storage with running statistics instead of lists
     epoch_storage = {
         # Episode metrics - these are still accumulated normally (small numbers)
@@ -1479,9 +1503,7 @@ def lstm_td3(resume_exp_dir=None,
         print(f"Created beam environment with observation space: {env.observation_space}")
         print(f"Created beam environment with action space: {env.action_space}")
         
-        # Set test environment for rendering callback
-        if rendering_callback is not None:
-            rendering_callback.test_env = test_env
+        
     elif partially_observable:
         env = POMDPWrapper(env_name, pomdp_type, flicker_prob, random_noise_sigma, random_sensor_missing_prob)
         test_env = POMDPWrapper(env_name, pomdp_type, flicker_prob, random_noise_sigma, random_sensor_missing_prob)
@@ -1530,6 +1552,30 @@ def lstm_td3(resume_exp_dir=None,
     # # Count variables (protip: try to get a feel for how different size networks behave!)
     # var_counts = tuple(core.count_vars(module) for module in [ac.pi, ac.q1, ac.q2])
     # logger.log('\nNumber of parameters: \t pi: %d, \t q1: %d, \t q2: %d\n' % var_counts)
+    # Initialize rendering callback if enabled
+    rendering_callback = None
+    if render_freq > 0 and use_beam_env:
+        try:
+            gif_save_path = osp.join(output_dir, 'training_gifs')
+            rendering_callback = RenderingCallback(
+                test_env=_make_test_gym_env(optimal_phases_path, max_ep_len),  # Will be set after environment creation
+                render_freq=render_freq,
+                save_path=gif_save_path,
+                max_hist_len=max_hist_len,
+                verbose=1,
+                obs_dim=obs_dim,
+                act_dim=act_dim,
+                act_limit=act_limit
+            )
+            print(f"Rendering callback enabled: frequency={render_freq}, save_path={gif_save_path}")
+        except Exception as e:
+            print(f"Warning: Could not initialize rendering callback: {e}")
+            rendering_callback = None
+    elif render_freq > 0 and not use_beam_env:
+        print("Warning: Rendering callback only supported for beam environments")
+        rendering_callback = None
+
+
 
     # Set up function for computing TD3 Q-losses
     def compute_loss_q(data):
@@ -1718,10 +1764,9 @@ def lstm_td3(resume_exp_dir=None,
         return np.mean(test_returns)
 
     # Prepare for interaction with environment
-
-    total_steps = steps_per_epoch * epochs
     start_time = time.time()
     past_t = 0
+    start_epoch = 0
     o, _ = env.reset()
     ep_ret, ep_len = 0, 0
     
@@ -1730,6 +1775,9 @@ def lstm_td3(resume_exp_dir=None,
         best_test_ret = float('-inf')
         best_model_saved = False
     # else: best_test_ret is set in resume section above
+    
+    # Latest test return tracking (for epochs when we don't test)
+    latest_test_ret = float('-inf')
 
     if max_hist_len > 0:
         o_buff = np.zeros([max_hist_len, obs_dim])
@@ -1797,6 +1845,7 @@ def lstm_td3(resume_exp_dir=None,
         replay_buffer = context_checkpoint['replay_buffer']
         start_time = context_checkpoint['start_time']
         past_t = context_checkpoint['t'] + 1  # Crucial add 1 step to t to avoid repeating.
+        start_epoch = context_checkpoint.get('epoch', 0) + 1  # Resume from next epoch
 
         # Restore model
         ac.load_state_dict(model_checkpoint['ac_state_dict'])
@@ -1805,264 +1854,286 @@ def lstm_td3(resume_exp_dir=None,
         q_optimizer.load_state_dict(model_checkpoint['q_optimizer_state_dict'])
 
     print("past_t={}".format(past_t))
-    print(f"Starting training loop. Total steps: {total_steps}, Steps per epoch: {steps_per_epoch}")
-    print(f"First epoch will complete at step: {steps_per_epoch}, Second at: {2*steps_per_epoch}")
+    print("start_epoch={}".format(start_epoch))
+    print(f"Starting training loop. Total epochs: {epochs}, Steps per epoch: {steps_per_epoch}")
+    print(f"Test frequency: every {test_freq} epochs (reduces testing overhead)")
+    if render_freq > 0:
+        print(f"Rendering frequency: every {render_freq} steps")
+    else:
+        print("Rendering disabled (render_freq=0)")
     
     # Main loop: collect experience in env and update/log each epoch
-    for t in tqdm(range(past_t, total_steps)):  # Start from the step after resuming.
-        # Until start_steps have elapsed, randomly sample actions
-        # from a uniform distribution for better exploration. Afterwards,
-        # use the learned policy (with some noise, via act_noise).
-        if t > start_steps:
-            a = get_action(o, o_buff, a_buff, o_buff_len, act_noise, device)
-        else:
-            a = env.action_space.sample()
-
-        # Step the env
-        o2, r, terminated, truncated, info = env.step(a)
-        d = terminated or truncated
-
-        ep_ret += r
-        ep_len += 1
-
-        # Ignore the "done" signal if it comes from hitting the time
-        # horizon (that is, when it's an artificial terminal signal
-        # that isn't based on the agent's state)
-        d = False if ep_len == max_ep_len else d
-
-        # Store experience to replay buffer
-        replay_buffer.store(o, a, r, o2, d)
-
-        # Add short history
-        if max_hist_len != 0:
-            if o_buff_len == max_hist_len:
-                o_buff[:max_hist_len - 1] = o_buff[1:]
-                a_buff[:max_hist_len - 1] = a_buff[1:]
-                o_buff[max_hist_len - 1] = list(o)
-                a_buff[max_hist_len - 1] = list(a)
+    t = past_t  # Global step counter
+    
+    for epoch in range(start_epoch, epochs):  # Loop over epochs
+        print(f"\n📊 STARTING EPOCH {epoch}")
+        epoch_step_count = 0
+        
+        # Inner loop: collect steps_per_epoch steps (or until some convergence condition)
+        while epoch_step_count < steps_per_epoch:
+            # Until start_steps have elapsed, randomly sample actions
+            # from a uniform distribution for better exploration. Afterwards,
+            # use the learned policy (with some noise, via act_noise).
+            if t > start_steps:
+                a = get_action(o, o_buff, a_buff, o_buff_len, act_noise, device)
             else:
-                o_buff[o_buff_len + 1 - 1] = list(o)
-                a_buff[o_buff_len + 1 - 1] = list(a)
-                o_buff_len += 1
+                a = env.action_space.sample()
 
-        # Super critical, easy to overlook step: make sure to update
-        # most recent observation!
-        o = o2
+            # Step the env
+            o2, r, terminated, truncated, info = env.step(a)
+            d = terminated or truncated
 
-        # End of trajectory handling
-        if d or (ep_len == max_ep_len):
-            # Store episode metrics for epoch-end logging
-            epoch_storage['EpRet'].append(ep_ret)
-            epoch_storage['EpLen'].append(ep_len)
-            
-            # TensorBoard logging for episode metrics
-            if use_tensorboard and tensorboard_writer is not None:
-                tensorboard_writer.add_scalar('Episode/Return', ep_ret, t)
-                tensorboard_writer.add_scalar('Episode/Length', ep_len, t)
-                if use_beam_env and hasattr(env, 'env') and hasattr(env.env, 'current_rel_dist'):
-                    phase_error_deg = env.env.current_rel_dist * 180 / np.pi
-                    tensorboard_writer.add_scalar('Episode/PhaseError_deg', phase_error_deg, t)
-                    converged = phase_error_deg < 0.5
-                    tensorboard_writer.add_scalar('Episode/Converged', float(converged), t)
-            
-            o, _ = env.reset()
-            ep_ret, ep_len = 0, 0
+            ep_ret += r
+            ep_len += 1
 
-            if max_hist_len > 0:
-                o_buff = np.zeros([max_hist_len, obs_dim])
-                a_buff = np.zeros([max_hist_len, act_dim])
-                o_buff[0, :] = o
-                o_buff_len = 0
-            else:
-                o_buff = np.zeros([1, obs_dim])
-                a_buff = np.zeros([1, act_dim])
-                o_buff_len = 0
+            # Ignore the "done" signal if it comes from hitting the time
+            # horizon (that is, when it's an artificial terminal signal
+            # that isn't based on the agent's state)
+            d = False if ep_len == max_ep_len else d
 
-            # Checkpoint saving moved to end of epoch after test evaluation
+            # Store experience to replay buffer
+            replay_buffer.store(o, a, r, o2, d)
 
-        # Update handling
-        if t >= update_after and t % update_every == 0:
-            for j in range(update_every):
-                batch = replay_buffer.sample_batch_with_history(batch_size, max_hist_len)
-                batch = {k: v.to(device) for k, v in batch.items()}
-                update(data=batch, timer=j)
+            # Add short history
+            if max_hist_len != 0:
+                if o_buff_len == max_hist_len:
+                    o_buff[:max_hist_len - 1] = o_buff[1:]
+                    a_buff[:max_hist_len - 1] = a_buff[1:]
+                    o_buff[max_hist_len - 1] = list(o)
+                    a_buff[max_hist_len - 1] = list(a)
+                else:
+                    o_buff[o_buff_len + 1 - 1] = list(o)
+                    a_buff[o_buff_len + 1 - 1] = list(a)
+                    o_buff_len += 1
+
+            # Super critical, easy to overlook step: make sure to update
+            # most recent observation!
+            o = o2
+
+            # End of trajectory handling
+            if d or (ep_len == max_ep_len):
+                # Store episode metrics for epoch-end logging
+                epoch_storage['EpRet'].append(ep_ret)
+                epoch_storage['EpLen'].append(ep_len)
                 
+                # TensorBoard logging for episode metrics
+                if use_tensorboard and tensorboard_writer is not None:
+                    tensorboard_writer.add_scalar('Episode/Return', ep_ret, t)
+                    tensorboard_writer.add_scalar('Episode/Length', ep_len, t)
+                    if use_beam_env and hasattr(env, 'env') and hasattr(env.env, 'current_rel_dist'):
+                        phase_error_deg = env.env.current_rel_dist * 180 / np.pi
+                        tensorboard_writer.add_scalar('Episode/PhaseError_deg', phase_error_deg, t)
+                        converged = phase_error_deg < 0.5
+                        tensorboard_writer.add_scalar('Episode/Converged', float(converged), t)
                 
+                o, _ = env.reset()
+                ep_ret, ep_len = 0, 0
 
-        # End of epoch handling
-        if (t + 1) % steps_per_epoch == 0:
-            epoch = (t + 1) // steps_per_epoch
-            print(f"\n📊 EPOCH {epoch} COMPLETED at step {t+1}")  # Diagnostic print
+                if max_hist_len > 0:
+                    o_buff = np.zeros([max_hist_len, obs_dim])
+                    a_buff = np.zeros([max_hist_len, act_dim])
+                    o_buff[0, :] = o
+                    o_buff_len = 0
+                else:
+                    o_buff = np.zeros([1, obs_dim])
+                    a_buff = np.zeros([1, act_dim])
+                    o_buff_len = 0
+
+            # Update handling
+            if t >= update_after and t % update_every == 0:
+                for j in range(update_every):
+                    batch = replay_buffer.sample_batch_with_history(batch_size, max_hist_len)
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    update(data=batch, timer=j)
+                    
             
-            # Test the performance of the deterministic version of the agent.
+
+            # Increment counters
+            t += 1
+            epoch_step_count += 1
+        
+        # END OF EPOCH - This is now guaranteed to be at the proper epoch boundary
+        print(f"📊 EPOCH {epoch} COMPLETED after {epoch_step_count} steps (total steps: {t})")
+        # Rendering callback (independent of epochs)
+        if rendering_callback is not None and rendering_callback.should_render(epoch):
+            try:
+                rendering_callback.generate_training_gif(ac, epoch, device)
+            except Exception as e:
+                print(f"Warning: Could not generate training GIF: {e}")
+        # Test the performance only on testing epochs
+        current_test_ret = None
+        if epoch % test_freq == 0:
+            print(f"🧪 TESTING at epoch {epoch} (test_freq={test_freq})")
             current_test_ret = test_agent()
+            latest_test_ret = current_test_ret
+            print(f"   Test return: {current_test_ret:.3f}")
+        else:
+            current_test_ret = latest_test_ret  # Use latest available
+            print(f"   Skipping test (last test return: {latest_test_ret:.3f})")
             
-            # Generate training GIF if rendering is enabled
-            if rendering_callback is not None and rendering_callback.should_render(t + 1):
-                try:
-                    rendering_callback.generate_training_gif(ac, t + 1, device)
-                except Exception as e:
-                    print(f"Warning: Could not generate training GIF: {e}")
-            
-            # TensorBoard logging for epoch-level metrics (replacing all logger functionality)
-            if use_tensorboard and tensorboard_writer is not None:
-                # Basic epoch metrics
-                tensorboard_writer.add_scalar('Epoch/Epoch', epoch, epoch)
+        # TensorBoard logging for epoch-level metrics (replacing all logger functionality)
+        if use_tensorboard and tensorboard_writer is not None:
+            # Basic epoch metrics
+            tensorboard_writer.add_scalar('Epoch/Epoch', epoch, epoch)
+            # Only log test return when we have fresh data
+            if epoch % test_freq == 0:
                 tensorboard_writer.add_scalar('Epoch/TestReturn', current_test_ret, epoch)
-                tensorboard_writer.add_scalar('Epoch/BestTestReturn', max(best_test_ret, current_test_ret), epoch)
-                tensorboard_writer.add_scalar('Epoch/TotalEnvInteracts', t + 1, epoch)
-                tensorboard_writer.add_scalar('Epoch/Time', time.time() - start_time, epoch)
-                
-                # Training episode returns with statistics
-                if len(epoch_storage['EpRet']) > 0:
-                    ep_rets = np.array(epoch_storage['EpRet'])
-                    tensorboard_writer.add_scalar('Epoch/EpRet_Mean', np.mean(ep_rets), epoch)
-                    tensorboard_writer.add_scalar('Epoch/EpRet_Std', np.std(ep_rets), epoch)
-                    tensorboard_writer.add_scalar('Epoch/EpRet_Min', np.min(ep_rets), epoch)
-                    tensorboard_writer.add_scalar('Epoch/EpRet_Max', np.max(ep_rets), epoch)
-                
-                # Test episode returns with statistics
-                if len(epoch_storage['TestEpRet']) > 0:
-                    test_ep_rets = np.array(epoch_storage['TestEpRet'])
-                    tensorboard_writer.add_scalar('Epoch/TestEpRet_Mean', np.mean(test_ep_rets), epoch)
-                    tensorboard_writer.add_scalar('Epoch/TestEpRet_Std', np.std(test_ep_rets), epoch)
-                    tensorboard_writer.add_scalar('Epoch/TestEpRet_Min', np.min(test_ep_rets), epoch)
-                    tensorboard_writer.add_scalar('Epoch/TestEpRet_Max', np.max(test_ep_rets), epoch)
-                
-                # Episode lengths (average only)
-                if len(epoch_storage['EpLen']) > 0:
-                    tensorboard_writer.add_scalar('Epoch/EpLen_Mean', np.mean(epoch_storage['EpLen']), epoch)
-                
-                if len(epoch_storage['TestEpLen']) > 0:
-                    tensorboard_writer.add_scalar('Epoch/TestEpLen_Mean', np.mean(epoch_storage['TestEpLen']), epoch)
-                
-                # Q-values and memory with statistics
-                if epoch_storage['Q1Vals_count'] > 0:
-                    tensorboard_writer.add_scalar('Epoch/Q1Vals_Mean', epoch_storage['Q1Vals_sum'] / epoch_storage['Q1Vals_count'], epoch)
-                    tensorboard_writer.add_scalar('Epoch/Q1Vals_Min', epoch_storage['Q1Vals_min'], epoch)
-                    tensorboard_writer.add_scalar('Epoch/Q1Vals_Max', epoch_storage['Q1Vals_max'], epoch)
-                
-                if epoch_storage['Q2Vals_count'] > 0:
-                    tensorboard_writer.add_scalar('Epoch/Q2Vals_Mean', epoch_storage['Q2Vals_sum'] / epoch_storage['Q2Vals_count'], epoch)
-                    tensorboard_writer.add_scalar('Epoch/Q2Vals_Min', epoch_storage['Q2Vals_min'], epoch)
-                    tensorboard_writer.add_scalar('Epoch/Q2Vals_Max', epoch_storage['Q2Vals_max'], epoch)
-                
-                if epoch_storage['Q1ExtractedMemory_count'] > 0:
-                    tensorboard_writer.add_scalar('Epoch/Q1ExtractedMemory_Mean', epoch_storage['Q1ExtractedMemory_sum'] / epoch_storage['Q1ExtractedMemory_count'], epoch)
-                    tensorboard_writer.add_scalar('Epoch/Q1ExtractedMemory_Min', epoch_storage['Q1ExtractedMemory_min'], epoch)
-                    tensorboard_writer.add_scalar('Epoch/Q1ExtractedMemory_Max', epoch_storage['Q1ExtractedMemory_max'], epoch)
-                
-                if epoch_storage['Q2ExtractedMemory_count'] > 0:
-                    tensorboard_writer.add_scalar('Epoch/Q2ExtractedMemory_Mean', epoch_storage['Q2ExtractedMemory_sum'] / epoch_storage['Q2ExtractedMemory_count'], epoch)
-                    tensorboard_writer.add_scalar('Epoch/Q2ExtractedMemory_Min', epoch_storage['Q2ExtractedMemory_min'], epoch)
-                    tensorboard_writer.add_scalar('Epoch/Q2ExtractedMemory_Max', epoch_storage['Q2ExtractedMemory_max'], epoch)
-                
-                # Actor memory with statistics
-                if epoch_storage['ActExtractedMemory_count'] > 0:
-                    tensorboard_writer.add_scalar('Epoch/ActExtractedMemory_Mean', epoch_storage['ActExtractedMemory_sum'] / epoch_storage['ActExtractedMemory_count'], epoch)
-                    tensorboard_writer.add_scalar('Epoch/ActExtractedMemory_Min', epoch_storage['ActExtractedMemory_min'], epoch)
-                    tensorboard_writer.add_scalar('Epoch/ActExtractedMemory_Max', epoch_storage['ActExtractedMemory_max'], epoch)
-                
-                # Loss metrics (average only)
-                if epoch_storage['LossQ_count'] > 0:
-                    tensorboard_writer.add_scalar('Epoch/LossQ_Mean', epoch_storage['LossQ_sum'] / epoch_storage['LossQ_count'], epoch)
-                
-                if epoch_storage['LossPi_count'] > 0:
-                    tensorboard_writer.add_scalar('Epoch/LossPi_Mean', epoch_storage['LossPi_sum'] / epoch_storage['LossPi_count'], epoch)
+            tensorboard_writer.add_scalar('Epoch/BestTestReturn', best_test_ret, epoch)
+            tensorboard_writer.add_scalar('Epoch/TotalEnvInteracts', t, epoch)
+            tensorboard_writer.add_scalar('Epoch/Time', time.time() - start_time, epoch)
             
-            # Save best model only when test performance improves
-            if current_test_ret > best_test_ret:
-                best_test_ret = current_test_ret
-                best_model_saved = True
-                
-                print(f"\n🎯 NEW BEST MODEL! Test return: {best_test_ret:.3f} (Epoch {epoch})")
-                
-                # Save the best model and context (overwrite previous)
-                fpath = '/afs/cern.ch/work/a/apastina/DatasetGen/datasetgenerator/lstm_td3_beam_logs/pyt_save'
-                # fpath = osp.join(logger.output_dir, fpath)
-                os.makedirs(fpath, exist_ok=True)
-                
-                # Simple filenames without step numbers - will overwrite previous best
-                context_fname = osp.join(fpath, 'best-context.pt')
-                model_fname = osp.join(fpath, 'best-model.pt')
-                
-                # Save context elements for the best model
-                context_elements = {
-                    'env': env, 
-                    'replay_buffer': replay_buffer,
-                    'epoch_storage': epoch_storage,
-                    'start_time': start_time, 
-                    't': t,
-                    'epoch': epoch,
-                    'best_test_ret': best_test_ret
-                }
-                
-                # Save model elements
-                model_elements = {
-                    'ac_state_dict': ac.state_dict(),
-                    'target_ac_state_dict': ac_targ.state_dict(),
-                    'pi_optimizer_state_dict': pi_optimizer.state_dict(),
-                    'q_optimizer_state_dict': q_optimizer.state_dict(),
-                    'epoch': epoch,
-                    'best_test_ret': best_test_ret,
-                    'total_steps': t
-                }
-                
-                # Save files
-                torch.save(context_elements, context_fname)
-                torch.save(model_elements, model_fname)
-                
-                context_size_mb = osp.getsize(context_fname) / (1024**2)
-                model_size_mb = osp.getsize(model_fname) / (1024**2)
-                print(f"   💾 Saved - Context: {context_size_mb:.1f}MB, Model: {model_size_mb:.1f}MB")
-            else:
-                print(f"   Test return: {current_test_ret:.3f} (Best: {best_test_ret:.3f})")
+            # Training episode returns with statistics
+            if len(epoch_storage['EpRet']) > 0:
+                ep_rets = np.array(epoch_storage['EpRet'])
+                tensorboard_writer.add_scalar('Epoch/EpRet_Mean', np.mean(ep_rets), epoch)
+                tensorboard_writer.add_scalar('Epoch/EpRet_Std', np.std(ep_rets), epoch)
+                tensorboard_writer.add_scalar('Epoch/EpRet_Min', np.min(ep_rets), epoch)
+                tensorboard_writer.add_scalar('Epoch/EpRet_Max', np.max(ep_rets), epoch)
+            
+            # Test episode returns with statistics (only when we have fresh test data)
+            if epoch % test_freq == 0 and len(epoch_storage['TestEpRet']) > 0:
+                test_ep_rets = np.array(epoch_storage['TestEpRet'])
+                tensorboard_writer.add_scalar('Epoch/TestEpRet_Mean', np.mean(test_ep_rets), epoch)
+                tensorboard_writer.add_scalar('Epoch/TestEpRet_Std', np.std(test_ep_rets), epoch)
+                tensorboard_writer.add_scalar('Epoch/TestEpRet_Min', np.min(test_ep_rets), epoch)
+                tensorboard_writer.add_scalar('Epoch/TestEpRet_Max', np.max(test_ep_rets), epoch)
+            
+            # Episode lengths (average only)
+            if len(epoch_storage['EpLen']) > 0:
+                tensorboard_writer.add_scalar('Epoch/EpLen_Mean', np.mean(epoch_storage['EpLen']), epoch)
+            
+            if epoch % test_freq == 0 and len(epoch_storage['TestEpLen']) > 0:
+                tensorboard_writer.add_scalar('Epoch/TestEpLen_Mean', np.mean(epoch_storage['TestEpLen']), epoch)
+            
+            # Q-values and memory with statistics
+            if epoch_storage['Q1Vals_count'] > 0:
+                tensorboard_writer.add_scalar('Epoch/Q1Vals_Mean', epoch_storage['Q1Vals_sum'] / epoch_storage['Q1Vals_count'], epoch)
+                tensorboard_writer.add_scalar('Epoch/Q1Vals_Min', epoch_storage['Q1Vals_min'], epoch)
+                tensorboard_writer.add_scalar('Epoch/Q1Vals_Max', epoch_storage['Q1Vals_max'], epoch)
+            
+            if epoch_storage['Q2Vals_count'] > 0:
+                tensorboard_writer.add_scalar('Epoch/Q2Vals_Mean', epoch_storage['Q2Vals_sum'] / epoch_storage['Q2Vals_count'], epoch)
+                tensorboard_writer.add_scalar('Epoch/Q2Vals_Min', epoch_storage['Q2Vals_min'], epoch)
+                tensorboard_writer.add_scalar('Epoch/Q2Vals_Max', epoch_storage['Q2Vals_max'], epoch)
+            
+            if epoch_storage['Q1ExtractedMemory_count'] > 0:
+                tensorboard_writer.add_scalar('Epoch/Q1ExtractedMemory_Mean', epoch_storage['Q1ExtractedMemory_sum'] / epoch_storage['Q1ExtractedMemory_count'], epoch)
+                tensorboard_writer.add_scalar('Epoch/Q1ExtractedMemory_Min', epoch_storage['Q1ExtractedMemory_min'], epoch)
+                tensorboard_writer.add_scalar('Epoch/Q1ExtractedMemory_Max', epoch_storage['Q1ExtractedMemory_max'], epoch)
+            
+            if epoch_storage['Q2ExtractedMemory_count'] > 0:
+                tensorboard_writer.add_scalar('Epoch/Q2ExtractedMemory_Mean', epoch_storage['Q2ExtractedMemory_sum'] / epoch_storage['Q2ExtractedMemory_count'], epoch)
+                tensorboard_writer.add_scalar('Epoch/Q2ExtractedMemory_Min', epoch_storage['Q2ExtractedMemory_min'], epoch)
+                tensorboard_writer.add_scalar('Epoch/Q2ExtractedMemory_Max', epoch_storage['Q2ExtractedMemory_max'], epoch)
+            
+            # Actor memory with statistics
+            if epoch_storage['ActExtractedMemory_count'] > 0:
+                tensorboard_writer.add_scalar('Epoch/ActExtractedMemory_Mean', epoch_storage['ActExtractedMemory_sum'] / epoch_storage['ActExtractedMemory_count'], epoch)
+                tensorboard_writer.add_scalar('Epoch/ActExtractedMemory_Min', epoch_storage['ActExtractedMemory_min'], epoch)
+                tensorboard_writer.add_scalar('Epoch/ActExtractedMemory_Max', epoch_storage['ActExtractedMemory_max'], epoch)
+            
+            # Loss metrics (average only)
+            if epoch_storage['LossQ_count'] > 0:
+                tensorboard_writer.add_scalar('Epoch/LossQ_Mean', epoch_storage['LossQ_sum'] / epoch_storage['LossQ_count'], epoch)
+            
+            if epoch_storage['LossPi_count'] > 0:
+                tensorboard_writer.add_scalar('Epoch/LossPi_Mean', epoch_storage['LossPi_sum'] / epoch_storage['LossPi_count'], epoch)
+        
+        # Save best model only when we have a fresh test result and it improves
+        if epoch % test_freq == 0 and current_test_ret > best_test_ret:
+            best_test_ret = current_test_ret
+            best_model_saved = True
+            
+            print(f"\n🎯 NEW BEST MODEL! Test return: {best_test_ret:.3f} (Epoch {epoch})")
+            
+            # Save the best model and context (overwrite previous)
+            fpath = osp.join(output_dir, 'pyt_save')
+            os.makedirs(fpath, exist_ok=True)
+            
+            # Simple filenames without step numbers - will overwrite previous best
+            context_fname = osp.join(fpath, 'best-context.pt')
+            model_fname = osp.join(fpath, 'best-model.pt')
+            
+            # Save context elements for the best model
+            context_elements = {
+                'env': env, 
+                'replay_buffer': replay_buffer,
+                'epoch_storage': epoch_storage,
+                'start_time': start_time, 
+                't': t,
+                'epoch': epoch,
+                'best_test_ret': best_test_ret
+            }
+            
+            # Save model elements
+            model_elements = {
+                'ac_state_dict': ac.state_dict(),
+                'target_ac_state_dict': ac_targ.state_dict(),
+                'pi_optimizer_state_dict': pi_optimizer.state_dict(),
+                'q_optimizer_state_dict': q_optimizer.state_dict(),
+                'epoch': epoch,
+                'best_test_ret': best_test_ret,
+                'total_steps': t
+            }
+            
+            # Save files
+            torch.save(context_elements, context_fname, pickle_protocol=4)
+            torch.save(model_elements, model_fname, pickle_protocol=4)
+            
+            context_size_mb = osp.getsize(context_fname) / (1024**2)
+            model_size_mb = osp.getsize(model_fname) / (1024**2)
+            print(f"   💾 Saved - Context: {context_size_mb:.1f}MB, Model: {model_size_mb:.1f}MB")
 
-            # Clear epoch storage for next epoch (replacing logger functionality)
-            # Reset episode lists (small data)
-            epoch_storage['EpRet'] = []
-            epoch_storage['EpLen'] = []
+        # Clear epoch storage for next epoch (replacing logger functionality)
+        # Reset episode lists (small data)
+        epoch_storage['EpRet'] = []
+        epoch_storage['EpLen'] = []
+        # Only clear test metrics when we actually ran tests
+        if epoch % test_freq == 0:
             epoch_storage['TestEpRet'] = []
             epoch_storage['TestEpLen'] = []
-            
-            # Reset running statistics counters
-            epoch_storage['LossQ_count'] = 0
-            epoch_storage['LossQ_sum'] = 0.0
-            epoch_storage['LossPi_count'] = 0
-            epoch_storage['LossPi_sum'] = 0.0
-            
-            # Reset Q-values statistics
-            epoch_storage['Q1Vals_count'] = 0
-            epoch_storage['Q1Vals_sum'] = 0.0
-            epoch_storage['Q1Vals_min'] = float('inf')
-            epoch_storage['Q1Vals_max'] = float('-inf')
-            
-            epoch_storage['Q2Vals_count'] = 0
-            epoch_storage['Q2Vals_sum'] = 0.0
-            epoch_storage['Q2Vals_min'] = float('inf')
-            epoch_storage['Q2Vals_max'] = float('-inf')
-            
-            # Reset memory statistics
-            epoch_storage['Q1ExtractedMemory_count'] = 0
-            epoch_storage['Q1ExtractedMemory_sum'] = 0.0
-            epoch_storage['Q1ExtractedMemory_min'] = float('inf')
-            epoch_storage['Q1ExtractedMemory_max'] = float('-inf')
-            
-            epoch_storage['Q2ExtractedMemory_count'] = 0
-            epoch_storage['Q2ExtractedMemory_sum'] = 0.0
-            epoch_storage['Q2ExtractedMemory_min'] = float('inf')
-            epoch_storage['Q2ExtractedMemory_max'] = float('-inf')
-            
-            epoch_storage['ActExtractedMemory_count'] = 0
-            epoch_storage['ActExtractedMemory_sum'] = 0.0
-            epoch_storage['ActExtractedMemory_min'] = float('inf')
-            epoch_storage['ActExtractedMemory_max'] = float('-inf')
-            
-            # Print epoch summary to console
-            print(f"Epoch {epoch} Summary:")
-            print(f"  Test Return: {current_test_ret:.3f} (Best: {max(best_test_ret, current_test_ret):.3f})")
-            print(f"  Total Steps: {t + 1}")
-            print(f"  Time Elapsed: {time.time() - start_time:.1f}s")
+        
+        # Reset running statistics counters
+        epoch_storage['LossQ_count'] = 0
+        epoch_storage['LossQ_sum'] = 0.0
+        epoch_storage['LossPi_count'] = 0
+        epoch_storage['LossPi_sum'] = 0.0
+        
+        # Reset Q-values statistics
+        epoch_storage['Q1Vals_count'] = 0
+        epoch_storage['Q1Vals_sum'] = 0.0
+        epoch_storage['Q1Vals_min'] = float('inf')
+        epoch_storage['Q1Vals_max'] = float('-inf')
+        
+        epoch_storage['Q2Vals_count'] = 0
+        epoch_storage['Q2Vals_sum'] = 0.0
+        epoch_storage['Q2Vals_min'] = float('inf')
+        epoch_storage['Q2Vals_max'] = float('-inf')
+        
+        # Reset memory statistics
+        epoch_storage['Q1ExtractedMemory_count'] = 0
+        epoch_storage['Q1ExtractedMemory_sum'] = 0.0
+        epoch_storage['Q1ExtractedMemory_min'] = float('inf')
+        epoch_storage['Q1ExtractedMemory_max'] = float('-inf')
+        
+        epoch_storage['Q2ExtractedMemory_count'] = 0
+        epoch_storage['Q2ExtractedMemory_sum'] = 0.0
+        epoch_storage['Q2ExtractedMemory_min'] = float('inf')
+        epoch_storage['Q2ExtractedMemory_max'] = float('-inf')
+        
+        epoch_storage['ActExtractedMemory_count'] = 0
+        epoch_storage['ActExtractedMemory_sum'] = 0.0
+        epoch_storage['ActExtractedMemory_min'] = float('inf')
+        epoch_storage['ActExtractedMemory_max'] = float('-inf')
+        
+        # Print epoch summary to console
+        print(f"Epoch {epoch} Summary:")
+        if epoch % test_freq == 0:
+            print(f"  Test Return: {current_test_ret:.3f} (Best: {best_test_ret:.3f})")
+        else:
+            print(f"  Latest Test Return: {latest_test_ret:.3f} (Best: {best_test_ret:.3f})")
+        print(f"  Total Steps: {t}")
+        print(f"  Time Elapsed: {time.time() - start_time:.1f}s")
     
     # Clean up TensorBoard writer
     if use_tensorboard and tensorboard_writer is not None:
@@ -2127,6 +2198,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_tensorboard', type=str2bool, nargs='?', const=True, default=False, help="Enable TensorBoard logging")
     parser.add_argument('--tensorboard_log_freq', type=int, default=100, help="TensorBoard logging frequency")
     parser.add_argument('--render_freq', type=int, default=0, help="Frequency of generating training GIFs (0 = disabled)")
+    parser.add_argument('--test_freq', type=int, default=10, help="How often (in terms of gap between epochs) to run test episodes")
     args = parser.parse_args()
 
     # Interpret without current feature extraction.
@@ -2191,4 +2263,5 @@ if __name__ == '__main__':
              save_freq=args.save_freq,
              use_tensorboard=args.use_tensorboard,
              tensorboard_log_freq=args.tensorboard_log_freq,
-             render_freq=args.render_freq)
+             render_freq=args.render_freq,
+             test_freq=args.test_freq)

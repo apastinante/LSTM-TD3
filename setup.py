@@ -11,11 +11,12 @@ setup(
     version='0.1',
     install_requires=[
         'joblib',
-        'gym<=0.17.3',
+        'gym',
         'numpy',
         'pybullet',
         'torch',
-        'pandas'
+        'pandas',
+        'blond'
     ],
     description="Long-Short-Term-Memory-based Twine Delayed Deep Deterministic Policy Gradient (LSTM-TD3)",
     author="Lingheng Meng",

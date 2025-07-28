@@ -17,6 +17,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'lstm_td3'))
 
 from lstm_td3.lstm_td3_tb_main import lstm_td3 as lstm_td3_tb
 from lstm_td3.lstm_td3_main import lstm_td3
+from lstm_td3.lstm_td3_tb_main_parallel import lstm_td3_parallel as lstm_td3_tb_parallel
+from lstm_td3.lstm_td3_tb_main_parallel_per import lstm_td3_parallel_per as lstm_td3_tb_parallel_per
+from lstm_td3.lstm_td3_tb_main_parallel_per_simp_reward import lstm_td3_parallel_per_simple_reward as lstm_td3_tb_parallel_per_simple_reward
 from lstm_td3.utils.logx import setup_logger_kwargs
 
 def main():
@@ -25,7 +28,7 @@ def main():
     """
     
     # Path to optimal phases (you'll need to adjust this path)
-    optimal_phases_path = '/afs/cern.ch/work/a/apastina/DatasetGen/datasetgenerator/optimal_phases_w_imp.pkl'
+    optimal_phases_path = os.path.join(os.path.dirname(__file__), 'optimal_phases_w_imp.pkl')
     
     # LSTM-TD3 hyperparameters optimized for beam environment
     # The key insight is that we want longer memory for temporal consistency
@@ -34,70 +37,89 @@ def main():
     config = {
         'use_beam_env': True,
         'optimal_phases_path': optimal_phases_path,
-        'seed': 44,
-        'epochs': round(5000*5/3),  # Reduced from default for testing
-        'steps_per_epoch': 30,  # Reduced for faster testing
-        'max_hist_len': 5,  # IMPORTANT: Memory of last 10 steps for temporal consistency
-        
-        # Learning parameters - conservative for stability
-        'gamma': 0.99,  # High discount for long-term stability
-        'pi_lr': 5e-4,  # Lower learning rate for policy
-        'q_lr': 8e-4,   # Slightly higher for critic
+        'seed': 30,
+        'epochs': 20000,  # Amount of epochs
+        'steps_per_epoch': 30,  # Amount of steps per epoch
+        'max_hist_len': 5,  # Memory of last 5 steps for temporal consistency
+
+        # Environment specific
+        'max_ep_len': 30,  # Max steps per episode (has to match the max_ep_len)
+        'num_test_episodes': 4,
+        'profile_slices': 1000, # Number of bins in the profile
+        'noise_level': 0.0, # Noise level for the returned profiles
+
+        # Learning parameters 
+        'gamma': 0.98,  # High discount for long-term stability
+        'pi_lr': 1e-4,  # Learning rate for policy
+        'q_lr': 2e-4,   # Learning rate for critic
         'polyak': 0.995,  # Slow target updates
         
-        # Exploration parameters - smaller for beam environment
-        'act_noise': 0.05,  # Reduced action noise (equivalent to ~3 degrees)
-        'target_noise': 0.02,  # Very small target noise
+        # Exploration parameters 
+        'act_noise': 0.08,  # Action noise (equivalent to ~5 degrees)
+        'target_noise': 0.03,  # Target noise
         'noise_clip': 0.1,
         
         # Training parameters
-        'batch_size': 128,
-        'start_steps': 5000,  # Random exploration steps
-        'update_after': 2000,
-        'update_every': 2,    # More frequent updates
-        'policy_delay': 2,    # Delayed policy updates
+        'batch_size': 256,
+        'start_steps': 20000,  # Random exploration steps
+        'update_after': 10000, # Update after 10000 steps of getting data
+        'update_every': 15,    # Update every 15 steps
+        'policy_delay': 3,    # Policy delay (TD3 Specific)
         
         # LSTM Architecture - optimized for beam environment
         # Smaller networks to avoid overfitting, focus on temporal patterns
         
         # Critic LSTM parameters
-        'critic_mem_pre_lstm_hid_sizes': (64,),  # Pre-processing
-        'critic_mem_lstm_hid_sizes': (128,),     # Main LSTM memory
-        'critic_mem_after_lstm_hid_size': (64,), # Post-LSTM processing
-        'critic_cur_feature_hid_sizes': (128, 64), # Current observation features
+        'critic_mem_pre_lstm_hid_sizes': (128,),  # Pre-processing
+        'critic_mem_lstm_hid_sizes': (256,),     # Main LSTM memory
+        'critic_mem_after_lstm_hid_size': (128,), # Post-LSTM processing
+        'critic_cur_feature_hid_sizes': (256, 128), # Current observation features
         'critic_post_comb_hid_sizes': (128,),    # Final combination
         'critic_hist_with_past_act': True,       # Include past actions in memory (VERY IMPORTANT)
         
-        # Actor LSTM parameters (similar but slightly smaller)
-        'actor_mem_pre_lstm_hid_sizes': (64,),
-        'actor_mem_lstm_hid_sizes': (128,),
-        'actor_mem_after_lstm_hid_size': (64,),
-        'actor_cur_feature_hid_sizes': (128, 64),
-        'actor_post_comb_hid_sizes': (64,),
+        # Actor LSTM parameters 
+        'actor_mem_pre_lstm_hid_sizes': (128,),
+        'actor_mem_lstm_hid_sizes': (256,),
+        'actor_mem_after_lstm_hid_size': (128,),
+        'actor_cur_feature_hid_sizes': (256, 128),
+        'actor_post_comb_hid_sizes': (128,),
         'actor_hist_with_past_act': True,
         
-        # Environment specific
-        'max_ep_len': 30,  # Max steps per episode (matches beam environment)
-        'num_test_episodes': 4,
+        
         
         # Experiment name
-        'exp_name': 'lstm_td3_beam_temporal_memory_updated',
+        'exp_name': 'lstm_td3_beam_temporal_memory_per_1000_no_noise',
 
         # Replay buffer size
-        'replay_size': 200_000,
+        'replay_size': 1_000_000,
         
         # TensorBoard logging (REQUIRED - replaces progress.txt logging)
         'use_tensorboard': True,
         'tensorboard_log_freq': 50,  # Log every 50 steps during training (less frequent for performance)
         'save_freq': 100,  # Save models every 100 epochs
-        'render_freq': 500,  # Save models every 500 epochs
+
+        # Testing parameters
+        'render_freq': 10000,  # Render every 10000 epochs (show performance)
+        'test_freq': 50,  # Test every 50 epochs
+
+        # Parallel training parameters
+        'n_envs': 0, # Number of environments to run in parallel (0 means all but 2 cores are used)
+
+        # PER parameters
+        'use_per': True, # Use Prioritized Experience Replay (PER)
+        'use_unified_buffer': True, # Use a single buffer for all environments (slight overhead but better performance)
+
+        # Resume training parameters
+        'resume_exp_dir': None, 
+        
+        
     }
-    
+    use_simple_reward = False
     # Setup logging
     logger_kwargs = setup_logger_kwargs(
         config['exp_name'], 
         config['seed'], 
-        data_dir='/afs/cern.ch/work/a/apastina/DatasetGen/datasetgenerator/lstm_td3_beam_logs_updated', 
+        data_dir= os.path.join(os.path.dirname(__file__), 'logs'), 
         datestamp=True
     )
     
@@ -119,14 +141,45 @@ def main():
         print(f"TensorBoard logs: {tensorboard_dir}")
         print("Monitor training with: tensorboard --logdir=" + tensorboard_dir)
         print("=" * 60)
-    
-    # Run LSTM-TD3 training
-    if config['use_tensorboard']:
-        lstm_td3_tb(
-            logger_kwargs=logger_kwargs,
-            **config
-        )
+        if config['n_envs'] > 1:
+            # config['update_every'] = config['update_every'] * config['n_envs']
+            if config['use_per']:
+                lstm_td3_tb_parallel_per(
+                    logger_kwargs=logger_kwargs,
+                    **config
+                ) 
+            else:
+                lstm_td3_tb_parallel(
+                    logger_kwargs=logger_kwargs,
+                    **config
+                )
+        elif config['n_envs'] <= 0:
+            config['n_envs'] = max(1, os.cpu_count()-2)
+            # config['update_every'] = config['update_every'] * config['n_envs']
+            if config['use_per']:
+                if use_simple_reward:
+                    lstm_td3_tb_parallel_per_simple_reward(
+                        logger_kwargs=logger_kwargs,
+                        **config
+                    )
+                else:
+                    lstm_td3_tb_parallel_per(
+                    logger_kwargs=logger_kwargs,
+                    **config
+                    )
+            else:
+                lstm_td3_tb_parallel(
+                logger_kwargs=logger_kwargs,
+                **config
+            )
+        else:
+            # Run LSTM-TD3 training
+            lstm_td3_tb(
+                logger_kwargs=logger_kwargs,
+                **config
+            )
     else:
+        # Parallel training is not supported without TensorBoard
         lstm_td3(
             logger_kwargs=logger_kwargs,
             **config

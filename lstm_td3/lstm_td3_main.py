@@ -46,12 +46,12 @@ from gymnasium import spaces
 def load_magnetic_field(b_choice: int):
     """Load and process magnetic field program"""
     if b_choice == 1:
-        sync_momentum = np.load('/afs/cern.ch/work/a/apastina/DatasetGen/datasetgenerator/programs/unnamed/Bfield.npy')
+        sync_momentum = np.load(os.path.join(os.path.dirname(__file__), 'programs', 'unnamed', 'Bfield.npy'))
         t_arr = sync_momentum[0].flatten()  # Time array [s]
         B_field = sync_momentum[1].flatten() * 1e-4  # Convert to Tesla
 
     elif b_choice == 2:
-        sync_momentum = np.load('/afs/cern.ch/work/a/apastina/DatasetGen/datasetgenerator/programs/TOF/Bfield.npy')
+        sync_momentum = np.load(os.path.join(os.path.dirname(__file__), 'programs', 'TOF', 'Bfield.npy'))
         t_arr = sync_momentum[0].flatten()  # Time array [s]
         B_field = sync_momentum[1].flatten() * 1e-4  # Convert to Tesla
 
@@ -140,7 +140,7 @@ def simulate_beam_profile_PSB(params, phi, random_phase_shift, noise=None, imp=T
 
         # Finemet cavity impedance table
         F_C = np.loadtxt(
-            '/afs/cern.ch/work/a/apastina/DatasetGen/datasetgenerator/EX_02_Finemet.txt',
+            os.path.join(os.path.dirname(__file__), 'Finemet.txt'),
             dtype=float, skiprows=1
         )
         F_C[:, 3] *= np.pi / 180
@@ -1589,8 +1589,8 @@ def lstm_td3(resume_exp_dir=None,
                 }
                 
                 # Save files
-                torch.save(context_elements, context_fname)
-                torch.save(model_elements, model_fname)
+                torch.save(context_elements, context_fname, pickle_protocol=4)
+                torch.save(model_elements, model_fname, pickle_protocol=4)
                 
                 context_size_mb = osp.getsize(context_fname) / (1024**2)
                 model_size_mb = osp.getsize(model_fname) / (1024**2)
